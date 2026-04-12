@@ -1,4 +1,6 @@
 import re
+from utils.legal_abbreviation import smart_expand_abbreviations
+from utils.abbreviation_store import extract_abbreviations
 
 ABBREVIATIONS = {
     "ADA": "Americans with Disabilities Act",
@@ -15,9 +17,11 @@ ABBREVIATIONS = {
     "FERPA": "Family Educational Rights and Privacy Act",
     "COPPA": "Children’s Online Privacy Protection Act",
     "SOX": "Sarbanes-Oxley Act",
-    "GDPR": "General Data Protection Regulation"
+    "GDPR": "General Data Protection Regulation",
+    "ERISA": "Employee Retirement Income Security Act",
+    "RICO": "Racketeer Influenced and Corrupt Organizations Act",
+    "DMCA": "Digital Millennium Copyright Act"
 }
-
 
 # -------------------------------
 # 🔹 Step 1: Clean Text
@@ -136,6 +140,34 @@ def restructure_query(text):
         return text
 
 
+# existing imports...
+
+# -------------------------------
+# 🔹 NEW FUNCTION (ADD HERE)
+# -------------------------------
+def format_restructured_query(query: str):
+    try:
+        if not query:
+            return query
+
+        q = query.strip()
+
+        # Capitalize first letter
+        q = q[0].upper() + q[1:] if len(q) > 1 else q.upper()
+
+        # Add punctuation
+        if not q.endswith(("?", ".", "!")):
+            question_words = ["what", "why", "how", "when", "where", "who", "can", "is", "are", "do", "does"]
+
+            if any(q.lower().startswith(w) for w in question_words):
+                q += "?"
+            else:
+                q += "."
+
+        return q
+
+    except Exception:
+        return query
 # -------------------------------
 # 🔹 Step 4: Main Preprocessing
 # -------------------------------
@@ -143,9 +175,23 @@ def preprocess_query(data: dict):
     try:
         cleaned = clean_text(data["query"])
 
-        expanded, abbr = expand_abbreviations(cleaned)
+        # ✅ STEP 1: Learn abbreviations FIRST
+        extract_abbreviations(cleaned)
 
+        # ✅ STEP 2: Smart expansion (auto + embedding)
+        expanded_query, smart_abbr = smart_expand_abbreviations(cleaned)
+
+        # ✅ STEP 3: Existing abbreviation expansion
+        expanded, abbr = expand_abbreviations(expanded_query)
+
+        # ✅ Merge both
+        abbr.update(smart_abbr)
+
+        # ✅ STEP 4: Restructure
         restructured = restructure_query(expanded)
+
+        # ✅ Format punctuation
+        restructured = format_restructured_query(restructured)
 
         return {
             "original_query": data["query"],

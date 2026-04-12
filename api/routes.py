@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Request, Body
-from pydantic import BaseModel
 from services.validation_service import validate_query
 from services.preprocessing_service import preprocess_query
 from services.classification_service import classify_query
@@ -9,58 +8,61 @@ import json
 router = APIRouter()
 
 
-# ✅ Schema for Swagger UI
-class QueryRequest(BaseModel):
-    query: str
-
-
-@router.post("/v1/process")
-async def process_query(
-    payload: QueryRequest = Body(...),   # ✅ FIX: Explicit body
-    request: Request = None
-):
+@router.post(
+    "/v1/process",
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"}
+                        },
+                        "example": {"query": "breach of contract"}
+                    }
+                },
+                "text/plain": {
+                    "schema": {
+                        "type": "string"
+                    },
+                    "example": "breach of contract"
+                }
+            }
+        }
+    }
+)
+async def process_query(request: Request):
     trace_id = "req-" + str(id(request))
 
     try:
         logger.info(f"Processing request {trace_id}")
 
         # -------------------------------
-        # 🔹 Primary query (Swagger input)
+        # 🔹 Universal Input Handler (KEY FIX)
         # -------------------------------
-        query = payload.query if payload else ""
+        raw_body = await request.body()
+        raw_text = raw_body.decode("utf-8").strip()
 
-        # -------------------------------
-        # 🔹 Fallback (NO CHANGE)
-        # -------------------------------
-        if not query and request:
-            try:
-                body = await request.json()
+        query = ""
 
-                if isinstance(body, dict):
-                    query = body.get("query", "")
+        # Try JSON parse
+        try:
+            parsed = json.loads(raw_text)
 
-                elif isinstance(body, str):
-                    try:
-                        parsed = json.loads(body)
-                        if isinstance(parsed, dict):
-                            query = parsed.get("query", "")
-                        else:
-                            query = body
-                    except Exception:
-                        query = body
+            if isinstance(parsed, dict):
+                query = parsed.get("query", "")
+            else:
+                query = raw_text
 
-                else:
-                    query = ""
-
-            except Exception:
-                raw_body = await request.body()
-                query = raw_body.decode("utf-8")
+        except Exception:
+            # Plain text fallback
+            query = raw_text
 
         # -------------------------------
-        # 🔹 CLEAN QUERY (UNCHANGED)
+        # 🔹 Clean query (UNCHANGED)
         # -------------------------------
-        query = str(query).strip()
-        query = query.replace("\n", "").replace("\\", "")
+        query = str(query).strip().replace("\n", "").replace("\\", "")
 
         if query.startswith("{") and "query" in query:
             try:

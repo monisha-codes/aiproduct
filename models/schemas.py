@@ -1,9 +1,13 @@
 from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+
 
 class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=5, max_length=2000)
+    # Keep schema permissive; let validation_service handle legal-specific checks
+    query: str = Field(..., min_length=1, max_length=5000)
+
 
 class APIResponse(BaseModel):
     status: str
-    data: dict | None = None
-    error: dict | None = None
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None

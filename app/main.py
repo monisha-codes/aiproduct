@@ -3,35 +3,44 @@ from api.routes import router
 from utils.legal_abbreviation import get_embedder
 from utils.abbreviation_store import load_abbreviations
 
-# ✅ Import model loaders (NO logic change)
-from services.validation_service import get_classifier, get_legal_bert
+from services.validation_service import get_classifier, get_legal_bert, get_validator_llm
+from services.preprocessing_service import get_rewriter
+from services.classification_service import get_ollama_classifier
+from services.system_service import get_system_llm
 
 app = FastAPI(title="Legal RAG API")
 
 app.include_router(router)
 
 
-# ✅ NEW: Load models once at startup (NO PROCESS CHANGE)
 @app.on_event("startup")
 def load_models():
     try:
-        print("🔹 Loading ML models...")
+        print("🔹 Loading ML models and resources...")
 
-        get_classifier()   # zero-shot model
-        get_legal_bert()   # legal BERT (if you added it)
+        # Validation / classification models
+        get_classifier()
+        get_legal_bert()
 
-        print("✅ Models loaded successfully")
+        # Abbreviation embedding model
+        get_embedder()
+
+        # Persistent abbreviation map
+        load_abbreviations()
+
+        # Ollama fallback config / warm-up
+        get_rewriter()
+        get_validator_llm()
+        get_ollama_classifier()
+        get_system_llm()
+
+        print("✅ All models and resources loaded successfully")
 
     except Exception as e:
-        print(f"❌ Model loading failed: {e}")
+        print(f"❌ Startup loading failed: {e}")
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-@app.on_event("startup")
-def load_models():
-    get_embedder()
-    load_abbreviations()   # ✅ ADD THIS
 

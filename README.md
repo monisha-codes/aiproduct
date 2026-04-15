@@ -1,195 +1,226 @@
-# ⚖️ Legal RAG System — Query Processing Modules (M-04, M-05, M-06)
+# ⚖️ Legal RAG API – Intelligent Legal Query Processing System
 
-## 📌 Overview
+This project implements a **modular Legal RAG (Retrieval-Augmented Generation) pipeline** designed to process, understand, and classify legal queries with high accuracy and safety.
 
-This project implements the core query processing layer of a Legal RAG (Retrieval-Augmented Generation) system.  
-It focuses on validating, cleaning, and understanding user queries before retrieval.
-
-Modules included:
-- M-04: Query Validation Gate
-- M-05: Query Preprocessing
-- M-06: Intent & Domain Classification
+It combines:
+- Rule-based NLP
+- ML models (Legal-BERT / classifiers)
+- LLMs (via Ollama)
+- Domain-specific preprocessing
 
 ---
 
-## 🧠 Architecture Flow
+# 🧩 System Architecture
 
+```text
 User Query
    ↓
-M-04 → Validation + PII Masking
+Validation Module
    ↓
-M-05 → Cleaning + Expansion
+Preprocessing Module
    ↓
-M-06 → Intent + Classification
+Classification Module
    ↓
-Output → Retrieval Engine
+(RAG / Retrieval / Future Response Layer)
+🔹 Core Modules
+1️⃣ Validation Module
+📌 Purpose
 
----
+Ensures input is:
 
-## 🚀 Features
-
-- PII detection and masking (US-based)
-- Legal domain validation
-- Query cleaning and normalization
-- Legal abbreviation expansion (USC, ADA, etc.)
-- Basic entity extraction
-- Intent and domain classification (zero-shot model)
-- Structured logging (JSON)
-- Error handling and fallback mechanisms
-- FastAPI-based API service
-- Modular and scalable design
-
----
-
-## 🛠️ Tech Stack
-
-- Python 3.10
-- FastAPI
-- spaCy
-- Transformers (HuggingFace)
-- PyTorch
-- Langdetect
-
----
-
-## 📁 Project Structure
-
-app/
-│
-├── main.py
-├── config.py
-├── logger.py
-│
-├── api/
-│   └── routes.py
-│
-├── models/
-│   └── schemas.py
-│
-├── services/
-│   ├── validation_service.py
-│   ├── preprocessing_service.py
-│   ├── classification_service.py
-│
-├── utils/
-│   └── pii.py
-│
-├── requirements.txt
-├── Dockerfile
-
----
-
-## ⚙️ Setup Instructions
-
-1. Clone repository
-
-git clone <repo-url>
-cd legal-rag-system
-
-2. Create virtual environment
-
-python -m venv venv
-
-Windows:
-venv\Scripts\activate
-
-Mac/Linux:
-source venv/bin/activate
-
-3. Install dependencies
-
-pip install -r requirements.txt
-
-4. Download spaCy model
-
-python -m spacy download en_core_web_sm
-
----
-
-## ▶️ Run the Application
-
-uvicorn app.main:app --reload
-
----
-
-## 🌐 API Access
-
-http://127.0.0.1:8000/docs
-
----
-
-## 📡 API Endpoint
-
-POST /v1/process
-
-### Request
-
+Clean
+Safe
+Legal-domain relevant
+Free from sensitive information
+⚙️ Responsibilities
+Query normalization
+Language detection
+Token counting
+Domain classification (legal vs non-legal)
+PII masking:
+Name
+Email
+Phone
+Confidence scoring
+🤖 Models Used
+Component	Technology
+Domain Classifier	ML model (custom / sklearn / lightweight classifier)
+Legal Context	Legal-BERT
+Fallback	LLM (via Ollama)
+📥 Input
 {
-  "query": "Explain Section 1983 USC for John Doe 9876543210"
+  "query": "Help John Doe john@example.com 9876543210 with tax filing rules"
 }
-
----
-
-### Response
-
+📤 Output
 {
-  "status": "success",
-  "data": {
-    "validation": {
-      "query": "Explain Section 1983 USC for [NAME] [PHONE]",
-      "pii_masked": true
-    },
-    "preprocessing": {
-      "expanded_query": "Explain Section 1983 United States Code..."
-    },
-    "classification": {
-      "domain": "constitutional law",
-      "intent": "definition",
-      "jurisdiction": ["US"]
-    }
+  "query": "help [NAME] doe [EMAIL] [PHONE] with tax filing rules",
+  "pii_masked": true,
+  "token_count": 9,
+  "lang": "en",
+  "domain_confidence": 0.91
+}
+2️⃣ Preprocessing Module
+📌 Purpose
+
+Transforms queries into structured, enriched, retrieval-ready format
+
+⚙️ Responsibilities
+Cleaning and normalization
+Abbreviation expansion
+Entity extraction
+Query restructuring
+LLM-based rewriting (fallback only)
+🧠 Key Features
+Preserves meaningful queries
+Avoids over-rewriting
+Handles short / ambiguous queries
+Keeps placeholders intact:
+[NAME]
+[EMAIL]
+[PHONE]
+🤖 Models Used
+Component	Technology
+Abbreviation Expansion	Embedding model
+Entity Extraction	Rule-based + NLP
+Query Rewriting	Ollama LLM
+Embeddings	Sentence Transformers / custom embedder
+📥 Input
+{
+  "query": "hipaa"
+}
+📤 Output
+{
+  "original_query": "hipaa",
+  "cleaned_query": "HIPAA",
+  "expanded_query": "Health Insurance Portability and Accountability Act (HIPAA)",
+  "restructured_query": "Explain the legal meaning of Health Insurance Portability and Accountability Act (HIPAA).",
+  "abbreviations": {
+    "HIPAA": "Health Insurance Portability and Accountability Act"
+  },
+  "entities": {
+    "acts": ["Health Insurance Portability and Accountability Act"],
+    "sections": [],
+    "citations": [],
+    "courts": []
   }
 }
+3️⃣ Classification Module
+📌 Purpose
 
----
+Identifies:
 
-## 🔐 Security
+Legal domain
+User intent
+Jurisdiction
+⚙️ Responsibilities
+Domain classification:
+Civil law
+Criminal law
+Corporate law
+Compliance
+Intent detection:
+Definition
+Explanation
+Compliance
+Case lookup
+Legal procedure
+Jurisdiction detection:
+US
+India
+Extendable
+🤖 Models Used
+Component	Technology
+Primary Classifier	ML model
+Semantic Understanding	Legal-BERT
+Fallback	Ollama LLM
+📥 Input
+{
+  "restructured_query": "Explain HIPAA rules"
+}
+📤 Output
+{
+  "domain": "civil law",
+  "intent": "compliance and regulation",
+  "jurisdiction": ["US"]
+}
+🤖 LLM Integration (Ollama)
 
-- No raw PII stored or logged
-- PII masked before processing
-- Input validation enforced
+The system uses local LLMs via Ollama for:
 
----
+Query rewriting
+Validation fallback
+Classification fallback
+System Q&A (capabilities)
+🔧 Supported Models
+Model	Size	Usage
+qwen2.5:3b	~2GB	Recommended (fast + lightweight)
+phi3	~2.2GB	Alternative
+llama3	~4.7GB	Higher quality
+🧪 Example Config
+{
+  "model": "qwen2.5:3b",
+  "base_url": "http://127.0.0.1:11434/api/generate"
+}
+🛠️ Tech Stack
+Backend
+FastAPI
+Python 3.10+
+NLP / ML
+Legal-BERT
+Sentence Transformers
+Custom classifiers
+LLM
+Ollama (local inference)
+Qwen / Phi / LLaMA models
+Utilities
+Regex-based parsing
+Abbreviation store
+Embedding search
+🔐 Safety Features
+✅ PII masking by default
+✅ Fail-safe fallback (LLM errors won't break pipeline)
+✅ Domain filtering (blocks non-legal queries)
+✅ Minimal query distortion
+⚡ Example End-to-End
+Input
+{
+  "query": "Explain HIPAA rules"
+}
+Output
+{
+  "validation": {...},
+  "preprocessing": {...},
+  "classification": {
+    "domain": "civil law",
+    "intent": "compliance and regulation",
+    "jurisdiction": ["US"]
+  }
+}
+🚀 Future Enhancements
+🔍 Vector database integration (FAISS / Pinecone)
+📚 Legal document ingestion pipeline
+🌍 Multi-language support
+🧠 Multi-turn conversation memory
+⚖️ Case law retrieval
+📄 PDF / DOCX parsing
+🧪 Running the Project
+uvicorn main:app --reload
 
-## ⚡ Performance
+Swagger UI:
 
-- Stateless API design
-- Lazy model loading
-- Scalable for large workloads
-- Ready for caching integration
+http://127.0.0.1:8000/docs
+👩‍💻 Project Vision
 
----
+This system is designed for:
 
-## 🧪 Testing
-
-- Unit tests recommended for:
-  - Validation logic
-  - PII masking
-  - Classification
-
----
-
-## 🐳 Docker
-
-Build:
-
-docker build -t legal-rag .
-
-Run:
-
-docker run -p 8000:8000 legal-rag
-
----
-
-## 🎯 Summary
-
-This module converts raw user queries into structured, validated, and classified inputs to enable accurate legal information retrieval.
+Legal AI assistants
+Compliance automation
+Contract analysis tools
+Enterprise legal intelligence systems
+Large-scale legal document processing
+📌 Key Design Principles
+Modular architecture
+Rule-first, LLM-second approach
+High reliability
+Low latency (local LLMs)
+Production-ready scalability

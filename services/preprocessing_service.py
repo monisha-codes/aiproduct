@@ -723,6 +723,23 @@ def needs_legal_prefix(query: str) -> bool:
 
     return any(term in q for term in legal_noun_terms)
 
+
+def is_meaningless_query(query: str) -> bool:
+    if not query:
+        return True
+
+    q = query.strip().lower()
+
+    if q in {"[name]", "[email]", "[phone]", "[ssn]", "[zip]"}:
+        return True
+
+    tokens = q.split()
+    weak_tokens = {"[name]", "[email]", "[phone]", "[ssn]", "[zip]", "what", "is", "the", "a", "an"}
+    if tokens and all(t in weak_tokens for t in tokens):
+        return True
+
+    return False
+
 def should_use_llm_as_primary_rewriter(query: str) -> bool:
     """
     Use LLM only for difficult legal fragments.

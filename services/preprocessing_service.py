@@ -4,10 +4,6 @@ from typing import Dict, List, Tuple, Any
 from spellchecker import SpellChecker
 from rapidfuzz import process, fuzz
 
-# Optional: keep your existing helpers
-# from utils.legal_abbreviation import smart_expand_abbreviations
-# from utils.abbreviation_store import extract_abbreviations
-
 ABBREVIATIONS = {
     "ADA": "Americans with Disabilities Act",
     "USC": "United States Code",
@@ -15,6 +11,9 @@ ABBREVIATIONS = {
     "CFR": "Code of Federal Regulations",
     "C.F.R.": "Code of Federal Regulations",
     "HIPAA": "Health Insurance Portability and Accountability Act",
+    "GDPR": "General Data Protection Regulation",
+    "CCPA": "California Consumer Privacy Act",
+    "FDCPA": "Fair Debt Collection Practices Act",
     "FLSA": "Fair Labor Standards Act",
     "EEOC": "Equal Employment Opportunity Commission",
     "FMLA": "Family and Medical Leave Act",
@@ -45,32 +44,74 @@ LEGAL_HINT_TERMS = {
     "section", "sec", "article", "title", "chapter", "usc", "u.s.c",
     "cfr", "c.f.r", "act", "regulation", "statute", "case", "holding",
     "judgment", "ruling", "plaintiff", "defendant", "liability", "damages",
-    "breach", "contract", "privacy", "compliance", "federal", "state"
+    "breach", "contract", "privacy", "compliance", "federal", "state",
+    "gdpr", "hipaa", "eeoc", "penalty", "violation", "employment", "rights"
 }
 
 spell = SpellChecker()
 rewriter = None
 
-# whitelist important legal words (VERY IMPORTANT)
 LEGAL_WHITELIST = {
-    "hipaa", "usc", "cfr", "fdcpa", "ada", "eeoc", "ferpa",
+    "hipaa", "usc", "cfr", "fdcpa", "ada", "eeoc", "ferpa", "gdpr", "ccpa",
     "coppa", "sox", "dmca", "ftc", "doj", "scotus",
     "flsa", "fmla", "erisa", "rico", "irs", "sec", "epa",
     "employment", "liability", "breach", "contract", "privacy",
     "compliance", "regulation", "statute", "damages", "plaintiff",
     "defendant", "court", "federal", "state", "implications", "check",
-    "legal", "advice", "regarding", "implication", "meaning"
+    "legal", "advice", "regarding", "implication", "meaning", "ssn",
+    "penalty", "penalties", "violation", "violations", "rights", "duties",
+    "law", "rules", "rule", "section", "title", "discrimination", "retaliation"
+}
+
+LEGAL_CANONICAL_TERMS = {
+    "legal", "law", "contract", "breach", "privacy", "regulation", "compliance",
+    "statute", "liability", "damages", "employment", "discrimination",
+    "retaliation", "penalty", "penalties", "violation", "violations",
+    "rights", "duties", "rules", "rule", "section", "title", "tax",
+    "gdpr", "hipaa", "eeoc", "usc", "cfr", "agreement", "consumer"
 }
 
 PLACEHOLDER_PATTERN = r"\[(NAME|PHONE|EMAIL|SSN|ZIP)\]"
+
+
+def protect_legal_tokens(text: str):
+    """
+    Protect legal abbreviations and placeholders before spell correction.
+    This prevents tokens like 'ssn' -> 'son' and 'gdpr' -> 'gear'.
+    """
+    protected = {}
+    words = text.split()
+
+    legal_tokens = {k.replace(".", "").upper() for k in ABBREVIATIONS.keys()}
+    legal_tokens.update({"SSN", "PHI", "PII"})
+
+    new_words = []
+    for i, w in enumerate(words):
+        normalized = re.sub(r"[^A-Za-z\[\]\.]", "", w).upper().replace(".", "")
+
+        if normalized in legal_tokens or (w.startswith("[") and w.endswith("]")):
+            key = f"__PROT_{i}__"
+            protected[key] = w
+            new_words.append(key)
+        else:
+            new_words.append(w)
+
+    return " ".join(new_words), protected
+
+
+def restore_legal_tokens(text: str, protected: dict):
+    for k, v in protected.items():
+        text = text.replace(k, v)
+    return text
+
 
 def correct_abbreviation_typos_in_preprocessing(query: str):
     """
     Correct likely legal abbreviation typos before generic spell correction.
     Example:
     hipa -> HIPAA
+    gdpr -> GDPR
     uscc -> USC
-    flasaa -> FLSA
     """
     try:
         if not query:
@@ -90,21 +131,18 @@ def correct_abbreviation_typos_in_preprocessing(query: str):
             raw = token
             clean = re.sub(r"[^a-zA-Z\.]", "", token).lower().replace(".", "")
 
-            # skip empty / very short / obvious question words
             if not clean or len(clean) < 3 or clean in {"what", "why", "how", "when", "who", "is", "are"}:
                 corrected_tokens.append(raw)
                 continue
 
-            # exact abbreviation already known
             if clean in known_abbr_map:
                 corrected_tokens.append(known_abbr_map[clean])
                 continue
 
-            # fuzzy abbreviation match
             match = process.extractOne(clean, known_abbr_keys, scorer=fuzz.ratio)
             if match:
                 candidate, score, _ = match
-                if score >= 80:
+                if score >= 84:
                     fixed = known_abbr_map[candidate]
                     corrected_tokens.append(fixed)
                     corrections[raw] = fixed
@@ -116,7 +154,62 @@ def correct_abbreviation_typos_in_preprocessing(query: str):
 
     except Exception:
         return query, {}
-    
+
+
+def correct_legal_term_typos(query: str):
+    """
+    Correct typo-heavy legal words before generic spell correction.
+    Examples:
+    brech -> breach
+    contrct -> contract
+    """
+    try:
+        if not query:
+            return query, {}
+
+        tokens = query.split()
+        corrected_tokens = []
+        corrections = {}
+
+        candidates = list(LEGAL_CANONICAL_TERMS)
+
+        for token in tokens:
+            raw = token
+
+            if raw.startswith("__PH_") or raw.startswith("__PROT_"):
+                corrected_tokens.append(raw)
+                continue
+
+            clean = re.sub(r"[^a-zA-Z]", "", raw).lower()
+
+            if not clean or len(clean) < 4:
+                corrected_tokens.append(raw)
+                continue
+
+            if clean in LEGAL_WHITELIST or clean in LEGAL_CANONICAL_TERMS:
+                corrected_tokens.append(raw)
+                continue
+
+            match = process.extractOne(clean, candidates, scorer=fuzz.ratio)
+            if match:
+                candidate, score, _ = match
+
+                # conservative threshold
+                if score >= 86:
+                    # avoid turning likely names/random words into legal terms
+                    if clean[0] == candidate[0] or len(clean) <= 6:
+                        corrected_tokens.append(candidate)
+                        corrections[raw] = candidate
+                        continue
+
+            corrected_tokens.append(raw)
+
+        return " ".join(corrected_tokens), corrections
+
+    except Exception:
+        return query, {}
+
+
 def get_rewriter():
     """
     Optional local LLM fallback via Ollama.
@@ -176,10 +269,17 @@ def repair_common_legal_phrases(text: str):
             r"\bssn check\b": "SSN check",
             r"\bcheck ssn\b": "SSN check",
             r"\bimplications legal\b": "legal implications",
+            r"\bmeaning of meaning of\b": "meaning of",
+            r"\bcontact law\b": "contract law",
+            r"\bgear rules\b": "GDPR rules",
         }
 
         for pattern, replacement in replacements.items():
             q = re.sub(pattern, replacement, q, flags=re.IGNORECASE)
+
+        q = re.sub(r"\bof of\b", "of", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bwith with\b", "with", q, flags=re.IGNORECASE)
+        q = re.sub(r"\s+", " ", q).strip()
 
         return q
 
@@ -192,55 +292,62 @@ def correct_spelling(query: str):
         if not query:
             return query
 
+        # Step 1: protect placeholders like [SSN]
         protected_query, protected_map = protect_placeholders(query)
 
-        # 🔥 NEW: correct legal abbreviation typos first
+        # Step 2: correct legal abbreviation typos first
         protected_query, abbr_corrections = correct_abbreviation_typos_in_preprocessing(protected_query)
+
+        # Step 3: protect legal tokens like ssn, usc, gdpr, hipaa before spell correction
+        protected_query, legal_token_map = protect_legal_tokens(protected_query)
+
+        # Step 4: correct typo-heavy legal words before generic spellchecker
+        protected_query, legal_term_corrections = correct_legal_term_typos(protected_query)
 
         words = protected_query.split()
         corrected_words = []
 
+        normalized_abbr_keys = {k.lower().replace(".", "") for k in ABBREVIATIONS.keys()}
+
         for word in words:
-            # preserve placeholders exactly
-            if word.startswith("__PH_") and word.endswith("__"):
+            if (word.startswith("__PH_") and word.endswith("__")) or (word.startswith("__PROT_") and word.endswith("__")):
                 corrected_words.append(word)
                 continue
 
             clean = re.sub(r"[^a-zA-Z_]", "", word).lower()
 
-            # skip empty / numbers / short tokens
             if not clean or len(clean) <= 2:
                 corrected_words.append(word)
                 continue
 
-            # skip known legal terms
             if clean in LEGAL_WHITELIST:
                 corrected_words.append(word)
                 continue
 
-            # skip known abbreviations and abbreviation corrections
-            normalized_abbr_keys = {k.lower().replace(".", "") for k in ABBREVIATIONS.keys()}
             if clean.replace(".", "") in normalized_abbr_keys:
                 corrected_words.append(word)
                 continue
 
-            if word in abbr_corrections.values():
+            if word in abbr_corrections.values() or word in legal_term_corrections.values():
                 corrected_words.append(word)
                 continue
 
-            # preserve uppercase abbreviations
             if word.isupper():
                 corrected_words.append(word)
                 continue
 
-            # 🔥 IMPORTANT: do not turn short legal-like tokens into common words
             if 3 <= len(clean) <= 6:
                 match = process.extractOne(clean, list(normalized_abbr_keys), scorer=fuzz.ratio)
-                if match and match[1] >= 75:
+                if match and match[1] >= 78:
                     corrected_words.append(word)
                     continue
 
             correction = spell.correction(clean)
+
+            # reject harmful generic corrections for legal-like words
+            if correction in {"gear", "contact", "son"} and clean in {"gdpr", "contrct", "ssn"}:
+                corrected_words.append(word)
+                continue
 
             if correction:
                 if word.istitle():
@@ -250,7 +357,14 @@ def correct_spelling(query: str):
                 corrected_words.append(word)
 
         corrected = " ".join(corrected_words)
+
+        # Step 5: restore legal tokens
+        corrected = restore_legal_tokens(corrected, legal_token_map)
+
+        # Step 6: restore placeholders
         corrected = restore_placeholders(corrected, protected_map)
+
+        corrected = repair_common_legal_phrases(corrected)
 
         return corrected
 
@@ -285,11 +399,8 @@ def clean_text(text: str) -> str:
     for old, new in replacements.items():
         text = text.replace(old, new)
 
-    # Preserve common legal symbols and references
     text = re.sub(r"[^\w\s\?\.\,\(\)\-\[\]§:/&']", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-
-    # Normalize repeated punctuation
     text = re.sub(r"\?{2,}", "?", text)
     text = re.sub(r"\.{2,}", ".", text)
     text = re.sub(r"\s+([?,.:;])", r"\1", text)
@@ -321,6 +432,22 @@ def extract_unknown_abbreviations(text: str) -> List[str]:
 
     return sorted(set(candidates))
 
+def normalize_legal_citation_shortcuts(text: str) -> str:
+    """
+    Convert citation-style shortcuts before generic abbreviation expansion.
+    Example:
+    - sec 1983 usc -> section 1983 USC
+    - sec. 101 cfr -> section 101 CFR
+    """
+    if not text:
+        return text
+
+    q = text
+
+    # sec 1983 -> section 1983
+    q = re.sub(r'\bsec\.?\s+(\d+[A-Za-z0-9\-\(\)]*)\b', r'section \1', q, flags=re.IGNORECASE)
+
+    return q
 
 def expand_abbreviations(text: str) -> Tuple[str, Dict[str, str], List[str]]:
     """
@@ -330,7 +457,8 @@ def expand_abbreviations(text: str) -> Tuple[str, Dict[str, str], List[str]]:
     mapping: Dict[str, str] = {}
     expanded = text
 
-    for short, full in ABBREVIATIONS.items():
+    # prefer longer keys first (e.g. U.S.C. before USC)
+    for short, full in sorted(ABBREVIATIONS.items(), key=lambda x: len(x[0]), reverse=True):
         pattern = re.compile(rf"\b{re.escape(short)}\b", re.IGNORECASE)
         if re.search(pattern, expanded):
             expanded = re.sub(pattern, f"{full} ({short})", expanded)
@@ -379,10 +507,6 @@ def extract_entities(text: str) -> Dict[str, List[str]]:
 
 
 def infer_legal_context(text: str, entities: Dict[str, List[str]], unknown_abbr: List[str]) -> Dict[str, Any]:
-    """
-    Helps prevent weak restructuring.
-    If the query includes legal hints, preserve that signal.
-    """
     text_lower = text.lower()
     hint_count = sum(1 for term in LEGAL_HINT_TERMS if term in text_lower)
 
@@ -397,8 +521,7 @@ def infer_legal_context(text: str, entities: Dict[str, List[str]], unknown_abbr:
 
 def should_use_llm_fallback(query: str) -> bool:
     """
-    Use LLM only for short/medium awkward legal queries.
-    Existing process stays the same; this is only a fallback.
+    Give LLM higher priority for awkward, typo-heavy, or fragment-style legal queries.
     """
     try:
         if not query:
@@ -406,30 +529,37 @@ def should_use_llm_fallback(query: str) -> bool:
 
         q = query.lower().strip()
 
-        if any(q.startswith(starter) for starter in QUESTION_STARTERS):
+        if len(q.split()) > 20:
             return False
 
-        if len(q.split()) > 15:
+        placeholder_count = len(re.findall(r"\[(?:NAME|EMAIL|PHONE|SSN|ZIP)\]", q, flags=re.IGNORECASE))
+        if placeholder_count >= 2:
             return False
 
         has_legal_signal = any(term in q for term in [
-            "law", "legal", "act", "rule", "section", "title",
+            "law", "legal", "act", "rule", "rules", "section", "title",
             "usc", "cfr", "contract", "privacy", "compliance",
             "liability", "breach", "employment", "hipaa", "ada",
-            "ssn", "[name]", "[phone]", "[ssn]", "implications", "advice"
+            "gdpr", "eeoc", "ssn", "implications", "advice", "rights", "tax"
         ])
 
         awkward_patterns = [
             r"\badvice legal\b",
-            r"\bssn\b.*\bcheck\b",
+            r"\bmeaning of\b",
+            r"\bhelp me with\b",
             r"\bcheck\b$",
-            r"\bfor\s+\[name\]\s+ssn\b",
             r"\bimplications\b.*\bcheck\b",
+            r"\bbrech\b",
+            r"\bcontrct\b",
         ]
 
         awkward = any(re.search(p, q, flags=re.IGNORECASE) for p in awkward_patterns)
 
-        return has_legal_signal and awkward
+        # prefer LLM for short fragments that are not natural questions
+        if has_legal_signal and (awkward or not any(q.startswith(starter) for starter in QUESTION_STARTERS)):
+            return True
+
+        return False
 
     except Exception:
         return False
@@ -437,18 +567,14 @@ def should_use_llm_fallback(query: str) -> bool:
 
 def llm_rewrite_query(query: str) -> str:
     """
-    Optional Ollama fallback to normalize awkward legal queries.
-    Safe mode:
-    - skip PII-heavy queries
-    - do not allow placeholder-token corruption
-    - only accept clearly usable rewrites
+    Optional Ollama rewrite.
+    Preserves placeholders and legal meaning.
     """
     try:
         model = get_rewriter()
         if not model:
             return query
 
-        # skip LLM rewrite for PII-heavy inputs
         placeholder_count = len(re.findall(r"\[(?:NAME|EMAIL|PHONE|SSN|ZIP)\]", query, flags=re.IGNORECASE))
         if placeholder_count >= 2:
             return query
@@ -456,12 +582,16 @@ def llm_rewrite_query(query: str) -> str:
         protected_query, protected_map = protect_placeholders(query)
 
         prompt = (
-            "Rewrite this into a short, natural legal search query.\n"
+            "Rewrite this into a short, natural, meaningful legal search query.\n"
             "Rules:\n"
             "- Keep the legal meaning.\n"
+            "- Fix obvious spelling mistakes in legal terms.\n"
+            "- Preserve placeholders exactly.\n"
+            "- Preserve legal citations and abbreviations correctly.\n"
+            "- Do not expand abbreviations incorrectly based only on ambiguity.\n"
+            "- Example: 'sec 1983 usc' should mean section 1983 of the U.S. Code, not Securities and Exchange Commission.\n"
             "- Do not invent facts.\n"
             "- Do not answer the question.\n"
-            "- Do not include labels like 'Query:' or 'Rewritten query:'.\n"
             "- Return only the rewritten query.\n\n"
             f"Query: {protected_query}"
         )
@@ -476,7 +606,7 @@ def llm_rewrite_query(query: str) -> str:
                     "temperature": 0.1
                 }
             },
-            timeout=30
+            timeout=6
         )
 
         if response.status_code == 200:
@@ -493,56 +623,179 @@ def llm_rewrite_query(query: str) -> str:
 
                 rewritten = restore_placeholders(rewritten, protected_map)
 
-                # reject broken placeholder outputs like PH_0 / PH_1 / PH_2
                 if re.search(r'\bPH_\d+\b', rewritten, flags=re.IGNORECASE):
                     return query
 
-                # reject outputs that are too short or obviously worse
                 if len(rewritten.split()) < 2:
                     return query
 
-                return rewritten
+                return repair_common_legal_phrases(rewritten)
 
         return query
 
     except Exception:
         return query
 
+
 def filter_irrelevant_placeholders(text: str) -> str:
     """
     Keep only legally meaningful placeholders.
     Remove noise placeholders like NAME, EMAIL, PHONE.
     """
-
-    # placeholders to REMOVE (noise)
-    remove_tags = ["NAME", "EMAIL", "PHONE", "ZIP"]
-
-    # placeholders to KEEP (legally meaningful)
     keep_tags = ["SSN", "PHI", "DOB"]
 
     def replacer(match):
         tag = match.group(1).upper()
         if tag in keep_tags:
-            return match.group(0)  # keep
-        return ""  # remove
+            return match.group(0)
+        return ""
 
     cleaned = re.sub(r'\[(\w+)\]', replacer, text)
-
-    # clean spacing
     cleaned = re.sub(r'\s+', ' ', cleaned).strip(" ,.-")
-
     return cleaned
 
 
+def normalize_rewrite_subject(text: str) -> str:
+    """
+    Remove duplicated lead phrases that cause meaningless framing.
+    """
+    q = text.strip()
+
+    q = re.sub(r'^\s*meaning of\s+', '', q, flags=re.IGNORECASE)
+    q = re.sub(r'^\s*legal meaning of\s+', '', q, flags=re.IGNORECASE)
+    q = re.sub(r'^\s*explain\s+', '', q, flags=re.IGNORECASE)
+    q = re.sub(r'^\s*define\s+', '', q, flags=re.IGNORECASE)
+    q = re.sub(r'^\s*help me with\s+', '', q, flags=re.IGNORECASE)
+    q = re.sub(r'^\s*help with\s+', '', q, flags=re.IGNORECASE)
+
+    q = re.sub(r'\s+', ' ', q).strip(" ,.-")
+    return q
+
+def strip_trailing_instruction_words(text: str) -> str:
+    """
+    Remove trailing instruction words that users append at the end,
+    like:
+    - sec 1983 usc explain
+    - hipaa define
+    - gdpr meaning
+    """
+    if not text:
+        return text
+
+    q = text.strip()
+
+    q = re.sub(
+        r'\b(explain|define|description|describe|meaning|summarize|summary)\b\s*$',
+        '',
+        q,
+        flags=re.IGNORECASE
+    )
+
+    q = re.sub(r'\s+', ' ', q).strip(" ,.-")
+    return q
+
+def needs_legal_prefix(query: str) -> bool:
+    """
+    Return True for short/medium legal noun-phrase queries that are not already
+    natural questions or explicit instructions.
+    """
+    if not query:
+        return False
+
+    q = query.strip().lower()
+
+    meaningful_starts = (
+        "what", "how", "why", "when", "can", "does", "is", "are",
+        "explain", "describe", "define", "compare", "list", "show",
+        "find", "give", "provide", "summarize"
+    )
+
+    if q.startswith(meaningful_starts):
+        return False
+
+    legal_noun_terms = [
+        "law", "legal", "contract", "breach", "privacy", "liability",
+        "damages", "violation", "penalty", "penalties", "rights",
+        "duties", "employment", "tax", "compliance", "regulation",
+        "gdpr", "hipaa", "eeoc", "usc", "cfr", "section", "title",
+        "agreement", "consumer", "discrimination", "retaliation"
+    ]
+
+    return any(term in q for term in legal_noun_terms)
+
+def should_use_llm_as_primary_rewriter(query: str) -> bool:
+    """
+    Use LLM only for difficult legal fragments.
+    This reduces latency while keeping quality.
+    """
+    try:
+        if not query:
+            return False
+
+        q = query.strip().lower()
+
+        if is_meaningless_query(q):
+            return False
+
+        placeholder_count = len(re.findall(r"\[(?:NAME|EMAIL|PHONE|SSN|ZIP)\]", q, flags=re.IGNORECASE))
+        if placeholder_count >= 2:
+            return False
+
+        meaningful_starts = (
+            "what", "how", "why", "when", "can", "does", "is", "are",
+            "explain", "describe", "define", "compare", "list", "show",
+            "find", "give", "provide", "summarize"
+        )
+        if q.startswith(meaningful_starts):
+            return False
+
+        token_count = len(q.split())
+
+        typo_like_patterns = [
+            r"\bbrech\b",
+            r"\bcontrct\b",
+            r"\bcontrat\b",
+            r"\bprvacy\b",
+            r"\bcmpliance\b",
+            r"\bhipa\b",
+            r"\buscc\b",
+            r"\bcfrr\b",
+        ]
+
+        ambiguous_patterns = [
+            r"\bsection\s+\d+\s+usc\b",
+            r"\bsection\s+\d+\s+cfr\b",
+            r"\b\d+\s+usc\b",
+            r"\b\d+\s+cfr\b",
+        ]
+
+        typo_like = any(re.search(p, q, flags=re.IGNORECASE) for p in typo_like_patterns)
+        ambiguous = any(re.search(p, q, flags=re.IGNORECASE) for p in ambiguous_patterns)
+
+        legal_terms = [
+            "law", "legal", "contract", "breach", "privacy", "tax",
+            "rule", "rules", "gdpr", "hipaa", "eeoc", "usc", "cfr",
+            "section", "title", "violation", "penalty", "employment"
+        ]
+        legal_like = any(term in q for term in legal_terms)
+
+        # only use LLM for short difficult fragments
+        if token_count <= 8 and legal_like and (typo_like or ambiguous):
+            return True
+
+        return False
+
+    except Exception:
+        return False
+
 def restructure_query(text: str, entities: dict, unknown_abbr: list):
     """
-    Conservative restructuring:
-    - preserve meaningful queries
-    - improve only when clearly helpful
-    - avoid collapsing PII-masked queries
-    - use LLM fallback only for safe non-PII awkward cases
+    LLM-primary restructuring:
+    - preserve already meaningful natural questions
+    - use LLM as primary rewriter for most short/medium legal queries
+    - use rule-based prefixes only as fallback
+    - avoid collapsing masked or meaningless text
     """
-
     try:
         if not text:
             return text
@@ -560,28 +813,7 @@ def restructure_query(text: str, entities: dict, unknown_abbr: list):
         def count_placeholders(value: str) -> int:
             return len(re.findall(r"\[(?:NAME|EMAIL|PHONE|SSN|ZIP)\]", value, flags=re.IGNORECASE))
 
-        def remove_filler_only(value: str) -> str:
-            cleaned = value
-
-            # remove polite filler only
-            cleaned = re.sub(
-                r'\b(please|kindly|assist me|i need help|need help)\b',
-                '',
-                cleaned,
-                flags=re.IGNORECASE
-            )
-
-            # normalize whitespace
-            cleaned = re.sub(r'\s+', ' ', cleaned).strip(" ,.-")
-            return cleaned
-
         def get_intent_prefix(q_low: str) -> str:
-            if any(k in q_low for k in ["help", "assist", "guide", "support"]):
-                return "Provide legal guidance on"
-
-            if any(k in q_low for k in ["what is", "define", "meaning of"]):
-                return "Explain the legal meaning of"
-
             if any(k in q_low for k in ["penalty", "penalties", "fine", "punishment", "violation", "violations"]):
                 return "Explain the legal consequences of"
 
@@ -591,142 +823,210 @@ def restructure_query(text: str, entities: dict, unknown_abbr: list):
             if any(k in q_low for k in ["rights", "duties", "obligations", "responsibilities"]):
                 return "Explain the legal rights and obligations in"
 
-            if any(k in q_low for k in ["contract", "agreement", "breach", "damages", "liability"]):
+            if any(k in q_low for k in ["rule", "rules", "compliance", "regulation", "policy", "tax"]):
+                return "Explain"
+
+            if any(k in q_low for k in ["contract", "agreement", "breach", "damages", "liability", "privacy"]):
                 return "Explain the legal aspects of"
 
-            if any(k in q_low for k in ["rule", "rules", "compliance", "regulation", "policy", "tax"]):
-                return "Provide legal guidance on"
+            if any(k in q_low for k in ["meaning", "define"]):
+                return "Explain the legal meaning of"
 
-            return "Explain the legal aspects of"
+            return "Explain"
 
-        def should_use_restructure_llm(original_q: str, candidate_q: str) -> bool:
-            oq = (original_q or "").lower().strip()
+        def looks_bad_candidate(candidate_q: str) -> bool:
             cq = (candidate_q or "").lower().strip()
-
-            # never use LLM when placeholders dominate
-            if count_placeholders(original_q) >= 2:
-                return False
-
-            awkward_patterns = [
-                r"^explain help\b",
-                r"^what is help\b",
-                r"\bwith with\b",
-                r"\bfor for\b",
-                r"\bon with\b",
+            bad_patterns = [
+                r"\bof of\b",
+                r"\bmeaning of meaning\b",
+                r"\bhelp me with\b",
+                r"\bexplain explain\b",
+                r"\bprovide legal guidance on help\b",
+                r"^what is\s*\?$",
+                r"^explain\s*\.$",
             ]
+            return any(re.search(p, cq, flags=re.IGNORECASE) for p in bad_patterns)
 
-            if any(re.search(p, cq, flags=re.IGNORECASE) for p in awkward_patterns):
-                return True
-
-            # short awkward fragments only
-            if len(cq.split()) <= 6 and not cq.startswith(meaningful_starts):
-                return True
-
-            # do not rewrite if candidate already looks cleaner than original
-            if len(cq) >= max(8, len(oq) * 0.6):
-                return False
-
-            return False
-
-        # 1. Preserve already meaningful queries
+        # preserve already meaningful natural questions
         if q_lower.startswith(meaningful_starts):
             return q
 
-        has_entities = any(len(v) > 0 for v in entities.values())
+        placeholder_count = count_placeholders(q)
 
-        has_legal_terms = any(k in q_lower for k in [
-            "law", "act", "rule", "section", "title",
+        # do not aggressively rewrite PII-heavy text
+        if placeholder_count >= 2:
+            return q
+
+        cleaned_q = filter_irrelevant_placeholders(q)
+        cleaned_q = normalize_rewrite_subject(cleaned_q)
+        cleaned_q = strip_trailing_instruction_words(cleaned_q)
+        cleaned_q = repair_common_legal_phrases(cleaned_q)
+        cleaned_q_lower = cleaned_q.lower()
+        subject = normalize_rewrite_subject(cleaned_q)
+        subject = strip_trailing_instruction_words(subject)
+
+        if not subject or is_meaningless_query(subject):
+            return q
+
+        has_entities = any(len(v) > 0 for v in entities.values())
+        has_legal_terms = any(k in cleaned_q_lower for k in [
+            "law", "act", "rule", "rules", "section", "title",
             "usc", "cfr", "contract", "privacy",
             "compliance", "liability", "breach", "advice",
             "tax", "penalty", "violation", "rights", "duties",
-            "filing", "employment"
+            "filing", "employment", "gdpr", "hipaa", "eeoc"
         ])
 
-        placeholder_count = count_placeholders(q)
-        cleaned_q = remove_filler_only(q)
-        cleaned_q = filter_irrelevant_placeholders(cleaned_q)
-        cleaned_q_lower = cleaned_q.lower()
+        # -------------------------------
+        # 1. LLM PRIMARY PATH
+        # -------------------------------
+        if should_use_llm_as_primary_rewriter(cleaned_q):
+            llm_candidate = llm_rewrite_query(cleaned_q)
+            if llm_candidate and len(llm_candidate.split()) >= 2:
+                llm_candidate = repair_common_legal_phrases(llm_candidate)
+                llm_candidate = strip_trailing_instruction_words(llm_candidate)
+                llm_candidate_lower = llm_candidate.lower().strip()
+                llm_subject = normalize_rewrite_subject(llm_candidate)
+                llm_subject = strip_trailing_instruction_words(llm_subject)
 
-        # 2. If query is PII-heavy, do not aggressively rewrite it.
-        # Keep expanded query if it is already clearer than any restructure.
-        if placeholder_count >= 2:
-            # remove only a leading "help" if present, but preserve the rest
-            pii_safe = re.sub(r'^\s*help\b', '', cleaned_q, flags=re.IGNORECASE).strip(" ,.-")
-            pii_safe = re.sub(r'\s+', ' ', pii_safe).strip()
+                if not looks_bad_candidate(llm_candidate):
+                    # If LLM returns only a fragment, add prefix
+                    if needs_legal_prefix(llm_subject) and not llm_candidate_lower.startswith(meaningful_starts):
+                        prefix = get_intent_prefix(llm_candidate_lower)
 
-            # if removing help makes it too awkward, keep original expanded text
-            if not pii_safe or len(pii_safe.split()) < 4:
-                return q
+                        if prefix.lower() == "explain":
+                            prefix = "Explain the legal aspects of"
 
-            # for mixed personal + legal topic queries, prefer the topic-focused suffix when obvious
-            m = re.search(r'\b(with|regarding|about)\b\s+(.+)$', pii_safe, flags=re.IGNORECASE)
-            if m:
-                topic = m.group(2).strip(" ,.-")
-                if topic and len(topic.split()) >= 2:
-                    prefix = get_intent_prefix(topic.lower())
-                    return f"{prefix} {topic}"
+                        return f"{prefix} {llm_subject}"
 
-            return q
+                    return llm_candidate
 
-        # 3. Short queries
-        if len(cleaned_q.split()) <= 5:
+        # -------------------------------
+        # 2. RULE-BASED FALLBACK
+        # -------------------------------
+        if len(cleaned_q.split()) <= 6:
             if unknown_abbr:
-                candidate = f"Explain the legal meaning of {cleaned_q}"
+                candidate = f"Explain the legal meaning of {subject}"
+
             elif "section" in cleaned_q_lower or "usc" in cleaned_q_lower or "cfr" in cleaned_q_lower:
-                candidate = f"What does {cleaned_q} refer to in US law"
+                candidate = f"Explain the legal meaning of {subject}"
+
+            elif needs_legal_prefix(subject):
+                prefix = get_intent_prefix(cleaned_q_lower)
+
+                if prefix.lower() == "explain":
+                    prefix = "Explain the legal aspects of"
+
+                candidate = f"{prefix} {subject}"
+
             elif has_entities or has_legal_terms:
                 prefix = get_intent_prefix(cleaned_q_lower)
-                candidate = f"{prefix} {cleaned_q}"
+                candidate = f"{prefix} {subject}"
+
             else:
                 candidate = f"What is {cleaned_q}"
 
-            if should_use_restructure_llm(q, candidate):
-                try:
-                    llm_candidate = llm_rewrite_query(cleaned_q)
-                    if llm_candidate and len(llm_candidate.strip()) >= len(candidate.strip()) * 0.7:
-                        return llm_candidate
-                except Exception:
-                    pass
+            candidate = repair_common_legal_phrases(candidate)
 
-            return candidate
+            if not looks_bad_candidate(candidate):
+                return candidate
 
-        # 4. Medium queries
-        if len(cleaned_q.split()) <= 12:
-            if has_entities:
-                candidate = f"Explain the legal meaning of {cleaned_q}"
-            elif has_legal_terms:
+            return cleaned_q
+
+        if len(cleaned_q.split()) <= 14:
+            if needs_legal_prefix(subject):
                 prefix = get_intent_prefix(cleaned_q_lower)
-                candidate = f"{prefix} {cleaned_q}"
-            else:
-                candidate = cleaned_q
 
-            if should_use_restructure_llm(q, candidate):
-                try:
-                    llm_candidate = llm_rewrite_query(cleaned_q)
-                    if llm_candidate and len(llm_candidate.strip()) >= len(candidate.strip()) * 0.7:
-                        return llm_candidate
-                except Exception:
-                    pass
+                if prefix.lower() == "explain":
+                    prefix = "Explain the legal aspects of"
 
-            return candidate
+                candidate = f"{prefix} {subject}"
+                candidate = repair_common_legal_phrases(candidate)
 
-        # 5. Long queries → keep as-is
+                if not looks_bad_candidate(candidate):
+                    return candidate
+
+            if has_entities or has_legal_terms:
+                prefix = get_intent_prefix(cleaned_q_lower)
+                candidate = f"{prefix} {subject}"
+                candidate = repair_common_legal_phrases(candidate)
+
+                if not looks_bad_candidate(candidate):
+                    return candidate
+
+            return cleaned_q
+
         return cleaned_q
 
     except Exception:
         return text
+
+
+def force_meaningful_legal_prefix(query: str) -> str:
+    """
+    Final safety layer:
+    If restructure_query still returns only a legal noun phrase,
+    add a meaningful legal prefix.
+    """
+    try:
+        if not query:
+            return query
+
+        q = strip_trailing_instruction_words(query.strip())
+        q_lower = q.lower()
+
+        meaningful_starts = (
+            "what", "how", "why", "when", "can", "does", "is", "are",
+            "explain", "describe", "define", "compare", "list", "show",
+            "find", "give", "provide", "summarize"
+        )
+
+        if q_lower.startswith(meaningful_starts):
+            return q
+
+        legal_terms = [
+            "law", "legal", "contract", "breach", "privacy", "liability",
+            "damages", "violation", "penalty", "penalties", "rights",
+            "duties", "employment", "tax", "compliance", "regulation",
+            "gdpr", "hipaa", "eeoc", "usc", "cfr", "section", "title",
+            "agreement", "consumer", "discrimination", "retaliation"
+        ]
+
+        if not any(term in q_lower for term in legal_terms):
+            return q
+
+        if any(k in q_lower for k in ["section", "usc", "cfr", "title"]):
+            return f"Explain the legal meaning of {q}"
+
+        if any(k in q_lower for k in ["penalty", "penalties", "fine", "punishment", "violation", "violations"]):
+            return f"Explain the legal consequences of {q}"
+
+        if any(k in q_lower for k in ["rights", "duties", "obligations", "responsibilities"]):
+            return f"Explain the legal rights and obligations in {q}"
+
+        if any(k in q_lower for k in ["how to", "process", "steps", "procedure", "file", "filing"]):
+            return f"Explain the legal procedure for {q}"
+
+        if any(k in q_lower for k in ["rule", "rules", "compliance", "regulation", "policy", "tax"]):
+            return f"Explain {q}"
+
+        return f"Explain the legal aspects of {q}"
+
+    except Exception:
+        return query
 
 def format_restructured_query(query: str):
     try:
         if not query:
             return query
 
-        q = query.strip()
-
-        # remove duplicate punctuation
+        q = repair_common_legal_phrases(query.strip())
         q = re.sub(r'[?.!]+$', '', q)
+        q = re.sub(r'\s+', ' ', q).strip()
 
-        # capitalize properly
+        if not q:
+            return query
+
         q = q[0].upper() + q[1:] if len(q) > 1 else q.upper()
 
         question_words = (
@@ -745,36 +1045,63 @@ def format_restructured_query(query: str):
         return query
 
 
+def strip_trailing_instruction_words(text: str) -> str:
+    """
+    Remove trailing instruction words like:
+    - explain
+    - define
+    - describe
+    - meaning
+    """
+    if not text:
+        return text
+
+    q = text.strip()
+
+    q = re.sub(
+        r'\b(explain|define|describe|description|meaning|summarize|summary)\b\s*$',
+        '',
+        q,
+        flags=re.IGNORECASE
+    )
+
+    q = re.sub(r'\s+', ' ', q).strip(" ,.-")
+    return q
+
+
 def preprocess_query(data: dict) -> dict:
     """
     Backward-compatible high-level preprocessing.
-    Keeps your current response shape while adding more signals.
+    Keeps current response shape unchanged.
     """
     try:
         raw_query = data.get("query", "")
 
         cleaned = clean_text(raw_query)
 
-        # spelling correction (same process, safer internals)
+        # normalize legal citation shortcuts before abbreviation expansion
+        cleaned = normalize_legal_citation_shortcuts(cleaned)
+
+        # spelling correction
         cleaned = correct_spelling(cleaned)
 
-        # lightweight phrase repair (same process, inserted before expansion)
+        # phrase repair
         cleaned = repair_common_legal_phrases(cleaned)
 
-        # optional LLM fallback (same flow, only for awkward legal queries)
-        if should_use_llm_fallback(cleaned):
-            cleaned = llm_rewrite_query(cleaned)
-
-        # Optional: keep your existing learning hook
-        # extract_abbreviations(cleaned)
-
         expanded_text, abbr_map, unknown_abbr = expand_abbreviations(cleaned)
+
+        # remove trailing command words before entity extraction / restructuring
+        expanded_text = strip_trailing_instruction_words(expanded_text)
 
         entities = extract_entities(expanded_text)
 
         restructured = restructure_query(expanded_text, entities, unknown_abbr)
-        restructured = format_restructured_query(restructured)
 
+        # remove trailing command words again in case any branch reintroduced them
+        restructured = strip_trailing_instruction_words(restructured)
+
+        restructured = force_meaningful_legal_prefix(restructured)
+        restructured = format_restructured_query(restructured)
         return {
             "original_query": raw_query,
             "cleaned_query": cleaned,

@@ -27,6 +27,78 @@ def _looks_like_legal_reference(text: str) -> bool:
     return any(re.search(p, t, flags=re.IGNORECASE) for p in legal_reference_patterns)
 
 
+def _is_common_legal_term(text: str) -> bool:
+    return text.lower().strip() in {
+        "court", "plaintiff", "defendant", "state", "section",
+        "act", "rule", "title", "code", "law", "legal", "contract",
+        "breach", "privacy", "compliance", "regulation", "statute",
+        "damages", "employment", "liability", "claim", "case"
+    }
+
+def _looks_like_name_tokens(parts: list[str]) -> bool:
+    """
+    Conservative name check:
+    - allow 2 or 3 token names only
+    - reject phrases containing legal words / stopwords
+    - reject obviously typo-heavy legal phrases
+    """
+    if len(parts) < 2 or len(parts) > 3:
+        return False
+
+    banned_tokens = {
+        "of", "for", "with", "under", "regarding", "about",
+        "law", "legal", "contract", "breach", "privacy", "rule", "rules",
+        "section", "title", "code", "act", "court", "case", "statute",
+        "compliance", "liability", "damages", "rights", "duties",
+        "gdpr", "hipaa", "eeoc", "usc", "cfr", "tax", "employment"
+    }
+
+    for p in parts:
+        p_low = p.lower().strip()
+
+        # weak token
+        if len(p_low) < 2:
+            return False
+
+        # legal / connector word inside phrase
+        if p_low in banned_tokens:
+            return False
+
+        # token should be alphabetic name-like
+        if not re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", p):
+            return False
+
+    return True 
+
+
+def _is_likely_person_entity(ent_text: str) -> bool:
+    """
+    Conservative PERSON masking:
+    - mask only likely personal names
+    - avoid masking typo-heavy legal phrases like:
+      'brech of contrct law'
+    """
+    cleaned = ent_text.strip()
+
+    if len(cleaned) < 3:
+        return False
+
+    if _looks_like_legal_reference(cleaned):
+        return False
+
+    if _is_common_legal_term(cleaned):
+        return False
+
+    # remove punctuation and split
+    parts = [p for p in re.split(r"\s+", re.sub(r"[^A-Za-z\s\-']", " ", cleaned)) if p]
+
+    # only allow true name-like tokens
+    if not _looks_like_name_tokens(parts):
+        return False
+
+    return True
+
+
 def mask_pii(text: str):
     try:
         if not text:
@@ -34,7 +106,6 @@ def mask_pii(text: str):
 
         pii_flag = False
         masked = text
-        protected_spans = []
 
         # -------------------------------
         # 🔹 Step 1: Regex masking
@@ -53,35 +124,27 @@ def mask_pii(text: str):
                 masked = new_masked
 
         # -------------------------------
-        # 🔹 Step 2: spaCy NER on original masked text
-        # Conservative PERSON masking
+        # 🔹 Step 2: spaCy NER
+        # Use title-cased copy only for better lowercase-name detection
+        # Example: "john doe" -> detected as PERSON
+        # Positions remain same because title() does not change string length
         # -------------------------------
-        doc = nlp(masked)
+        detection_text = masked.title()
+        doc = nlp(detection_text)
 
         spans_to_mask = []
         for ent in doc.ents:
             if ent.label_ != "PERSON":
                 continue
 
-            ent_text = ent.text.strip()
+            ent_text = masked[ent.start_char:ent.end_char].strip()
 
-            # Skip very short or weak entities
-            if len(ent_text) < 3:
-                continue
-
-            # Skip legal references / case names
-            if _looks_like_legal_reference(ent_text):
-                continue
-
-            # Skip common legal words that may be misclassified
-            if ent_text.lower() in {
-                "court", "plaintiff", "defendant", "state", "section",
-                "act", "rule", "title", "code"
-            }:
+            if not _is_likely_person_entity(ent_text):
                 continue
 
             start, end = ent.start_char, ent.end_char
 
+            # avoid overlapping spans
             if not _overlaps(spans_to_mask, start, end):
                 spans_to_mask.append((start, end))
 

@@ -99,14 +99,17 @@ async def process_query(request: Request):
         try:
             if detect_system_query(query):
                 system_answer = get_system_response(query)
-                return {
-                    "status": "success",
-                    "data": {
-                        "type": "system_response",
-                        "query": query,
-                        "answer": system_answer
+
+                if system_answer and str(system_answer).strip():
+                    return {
+                        "status": "success",
+                        "data": {
+                            "type": "system_response",
+                            "query": query,
+                            "answer": system_answer
+                        }
                     }
-                }
+
         except Exception as system_error:
             logger.warning(f"System layer failed for {trace_id}: {str(system_error)}")
 

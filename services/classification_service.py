@@ -70,12 +70,13 @@ INTENTS = [
     "contract analysis"
 ]
 
+
 # -------------------------------
 # 🔹 Lightweight rule signals
 # Keep rules as strong overrides only
 # -------------------------------
 def detect_domain_rule(query: str):
-    q = query.lower()
+    q = (query or "").lower()
 
     if any(k in q for k in [
         "constitution", "constitutional", "amendment", "bill of rights",
@@ -96,32 +97,33 @@ def detect_domain_rule(query: str):
     if any(k in q for k in [
         "employment", "employee", "employer", "workplace", "termination",
         "wage", "overtime", "discrimination", "harassment", "fmla",
-        "flsa", "eeoc", "ada accommodation", "retaliation"
+        "flsa", "eeoc", "ada accommodation", "retaliation", "equal employment"
     ]):
         return "employment law", 0.95
 
     if any(k in q for k in [
         "hipaa", "patient", "medical record", "health information",
-        "protected health information", "phi", "healthcare"
+        "protected health information", "phi", "healthcare", "hitech"
     ]):
-        return "healthcare law", 0.92
+        return "healthcare law", 0.94
 
     if any(k in q for k in [
         "privacy", "data protection", "personal data", "gdpr",
-        "ccpa", "coppa", "consent", "data sharing", "tracking", "pii"
+        "ccpa", "coppa", "consent", "data sharing", "tracking", "pii",
+        "confidentiality", "consumer privacy"
     ]):
-        return "privacy and data protection law", 0.92
+        return "privacy and data protection law", 0.95
 
     if any(k in q for k in [
         "copyright", "trademark", "patent", "dmca",
         "intellectual property", "licensing"
     ]):
-        return "intellectual property law", 0.92
+        return "intellectual property law", 0.94
 
     if any(k in q for k in [
-        "tax", "irs", "deduction", "income tax", "withholding"
+        "tax", "irs", "deduction", "income tax", "withholding", "filing"
     ]):
-        return "tax law", 0.92
+        return "tax law", 0.93
 
     if any(k in q for k in [
         "corporate", "company", "shareholder", "merger",
@@ -141,13 +143,13 @@ def detect_domain_rule(query: str):
 
 
 def detect_intent_rule(query: str):
-    q = query.lower()
+    q = (query or "").lower().strip()
 
     if any(k in q for k in ["what is", "define", "meaning of", "explain"]):
-        return "definition of law", 0.88
+        return "definition of law", 0.90
 
-    if any(k in q for k in ["how to", "procedure", "steps", "process"]):
-        return "legal procedure", 0.92
+    if any(k in q for k in ["how to", "procedure", "steps", "process", "filing process"]):
+        return "legal procedure", 0.93
 
     if any(k in q for k in ["case", "judgment", "ruling", "precedent", "holding"]):
         return "case lookup", 0.95
@@ -158,14 +160,14 @@ def detect_intent_rule(query: str):
     if any(k in q for k in ["penalty", "punishment", "fine", "imprisonment", "sentence", "violation", "violations"]):
         return "penalties and punishment", 0.95
 
-    if any(k in q for k in ["compliance", "regulation", "rule", "policy requirement"]):
-        return "compliance and regulation", 0.92
+    if any(k in q for k in ["compliance", "regulation", "rule", "rules", "policy requirement"]):
+        return "compliance and regulation", 0.93
 
     if any(k in q for k in ["interpret", "interpretation", "meaning of section", "scope of"]):
         return "legal interpretation", 0.90
 
     if re.search(r"\b(section|sec\.?|title|usc|u\.s\.c|cfr|c\.f\.r)\b", q):
-        return "statutory explanation", 0.90
+        return "statutory explanation", 0.92
 
     if any(k in q for k in ["breach of contract", "contract clause", "agreement terms"]):
         return "contract analysis", 0.92
@@ -182,7 +184,7 @@ def classify_with_zero_shot(model, query: str, labels: list[str]):
 
 
 def detect_temporal(query: str) -> bool:
-    q = query.lower()
+    q = (query or "").lower()
     temporal_terms = [
         "latest", "recent", "current", "today", "recently",
         "updated", "amended", "new", "now"
@@ -191,7 +193,7 @@ def detect_temporal(query: str) -> bool:
 
 
 def detect_complexity(query: str) -> str:
-    q = query.lower()
+    q = (query or "").lower()
 
     multi_jurisdiction = any(k in q for k in [
         "compare us and eu", "us vs eu", "federal and state", "state and federal"
@@ -243,11 +245,9 @@ def get_retrieved_context(data: dict) -> str:
         if not isinstance(data, dict):
             return ""
 
-        # direct string context
         if isinstance(data.get("retrieved_context"), str):
             return data["retrieved_context"].strip()
 
-        # list of chunk dicts
         chunks = data.get("retrieved_chunks") or data.get("context_chunks") or []
         if isinstance(chunks, list):
             texts = []
@@ -266,9 +266,21 @@ def get_retrieved_context(data: dict) -> str:
         return ""
 
 
+def looks_like_short_definition_query(query: str) -> bool:
+    q = (query or "").lower().strip()
+
+    if any(q.startswith(x) for x in ["what is", "explain", "define", "meaning of"]):
+        return True
+
+    if any(x in q for x in ["hipaa", "gdpr", "eeoc", "usc", "cfr"]):
+        return True
+
+    return False
+
+
 def llm_classify_query(query: str, context: str = ""):
     """
-    Ollama primary classifier.
+    Ollama classifier.
     Returns: (domain, intent, jurisdiction, confidence)
     If context is provided, it performs RAG-aware classification.
     """
@@ -358,14 +370,12 @@ def classify_query(data):
         rule_intent, rule_intent_score = detect_intent_rule(query)
 
         # -------------------------------
-        # 🔹 Domain + intent from Ollama (primary)
-        # Query-only
+        # 🔹 Domain + intent from Ollama
         # -------------------------------
         llm_domain, llm_intent, llm_jurisdiction, llm_confidence = llm_classify_query(query)
 
         # -------------------------------
         # 🔹 Optional RAG-aware refinement
-        # Only if context exists
         # -------------------------------
         if retrieved_context:
             rag_domain, rag_intent, rag_jurisdiction, rag_confidence = llm_classify_query(
@@ -380,7 +390,7 @@ def classify_query(data):
                 llm_confidence = rag_confidence
 
         # -------------------------------
-        # 🔹 Zero-shot fallback
+        # 🔹 Zero-shot
         # -------------------------------
         model_domain, model_domain_score = classify_with_zero_shot(model, query, DOMAINS)
         model_intent, model_intent_score = classify_with_zero_shot(model, query, INTENTS)
@@ -390,7 +400,7 @@ def classify_query(data):
         # -------------------------------
         if rule_domain and rule_domain_score >= 0.95:
             chosen_domain = rule_domain
-        elif llm_domain and llm_confidence >= 0.60:
+        elif llm_domain and llm_confidence >= 0.62:
             chosen_domain = llm_domain
         elif rule_domain and rule_domain_score > model_domain_score + 0.08:
             chosen_domain = rule_domain
@@ -402,9 +412,11 @@ def classify_query(data):
         # -------------------------------
         # 🔹 INTENT selection
         # -------------------------------
-        if rule_intent and rule_intent_score >= 0.95:
+        if looks_like_short_definition_query(query):
+            intent = "definition of law"
+        elif rule_intent and rule_intent_score >= 0.95:
             intent = rule_intent
-        elif llm_intent and llm_confidence >= 0.60:
+        elif llm_intent and llm_confidence >= 0.62:
             intent = llm_intent
         elif rule_intent and rule_intent_score > model_intent_score + 0.08:
             intent = rule_intent
@@ -413,7 +425,6 @@ def classify_query(data):
 
         # -------------------------------
         # 🔹 Jurisdiction
-        # Keep your current flow stable
         # -------------------------------
         jurisdiction = ["US"]
 
@@ -423,16 +434,10 @@ def classify_query(data):
         if any(k in query.lower() for k in ["california", "new york", "texas", "florida"]):
             jurisdiction = ["US"]
 
-        # -------------------------------
-        # 🔹 Optional internal signals
-        # not returned now, so your flow is not affected
-        # -------------------------------
+        # optional internal signals (kept unused externally)
         _temporal = detect_temporal(query)
         _complexity = detect_complexity(query)
 
-        # -------------------------------
-        # 🔹 Final Output (same shape)
-        # -------------------------------
         return {
             "domain": domain,
             "intent": intent,

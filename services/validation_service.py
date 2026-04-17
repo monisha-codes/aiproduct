@@ -13,7 +13,7 @@ import requests
 # -------------------------------
 LEGAL_KEYWORDS = [
     "law", "legal", "act", "section", "statute", "code",
-    "regulation", "compliance", "policy", "rule",
+    "regulation", "compliance", "policy", "rule", "rules",
     "contract", "agreement", "liability", "obligation",
     "rights", "duty", "penalty", "penalties", "violation", "violations",
     "court", "judge", "case", "lawsuit", "claim",
@@ -28,7 +28,7 @@ LEGAL_KEYWORDS = [
     "ssn", "social security", "personal data", "confidentiality",
     "nda", "non-disclosure", "licensing", "trademark", "copyright", "patent",
 
-    # Abbreviations / US legal signals
+    # Abbreviations / legal signals
     "hipaa", "ada", "usc", "u.s.c", "cfr", "c.f.r", "gdpr",
     "flsa", "fmla", "eeoc", "osha", "erisa", "rico",
     "dmca", "coppa", "ferpa", "sox", "scotus", "ftc", "doj",
@@ -42,6 +42,27 @@ KNOWN_LEGAL_ABBREVIATIONS = {
     "RICO", "DMCA", "COPPA", "FERPA", "SOX", "SCOTUS",
     "FTC", "DOJ", "IRS", "SEC", "EPA", "CCPA", "FDCPA",
     "NLRB", "PHI", "PII", "ACA", "HITECH", "EULA", "NDA"
+}
+
+NON_LEGAL_SYSTEM_HINTS = {
+    "what can you do",
+    "how can you help",
+    "how can you assist",
+    "how can you assist me",
+    "what are your capabilities",
+    "what is your workflow",
+    "what is your pipeline",
+    "how does your system work",
+    "what happens after i send a query",
+    "what models do you use",
+    "what modules do you have",
+    "what agents do you have",
+}
+
+CLEAR_NON_LEGAL_HINTS = {
+    "movie", "movies", "recipe", "cook", "cooking", "biryani",
+    "laptop", "mobile", "phone price", "weather", "temperature",
+    "cricket", "football", "music", "song", "restaurant", "shopping"
 }
 
 classifier = None
@@ -145,7 +166,7 @@ def correct_legal_abbreviation_typos(query: str):
     Examples:
     hipa -> HIPAA
     uscc -> USC
-    flasaa -> FLSA
+    gdpr -> GDPR
     """
     try:
         if not query:
@@ -203,16 +224,48 @@ def has_legal_citation(query: str) -> bool:
     return any(re.search(p, query, flags=re.IGNORECASE) for p in patterns)
 
 
+def looks_like_system_query(query: str) -> bool:
+    q = (query or "").lower().strip()
+    if not q:
+        return False
+
+    if any(hint in q for hint in NON_LEGAL_SYSTEM_HINTS):
+        return True
+
+    system_patterns = [
+        r"\bhow\b.*\b(help|assist|support)\b",
+        r"\bwhat\b.*\b(can you do|do you do|support|capabilities?)\b",
+        r"\bhow\b.*\b(system|workflow|pipeline)\b",
+        r"\bwhat happens\b.*\b(query|validation|preprocessing|classification)\b",
+    ]
+    return any(re.search(p, q, flags=re.IGNORECASE) for p in system_patterns)
+
+
+def looks_clearly_non_legal(query: str) -> bool:
+    q = (query or "").lower().strip()
+    if not q:
+        return False
+
+    if looks_like_system_query(q):
+        return False
+
+    if any(term in q for term in CLEAR_NON_LEGAL_HINTS):
+        return True
+
+    return False
+
+
 def has_strong_legal_signal(query: str, expanded_query: str, smart_abbr: dict) -> bool:
     query_lower = expanded_query.lower()
 
     strong_keywords = [
         "law", "act", "section", "court", "legal",
         "regulation", "compliance", "rights",
-        "liability", "statute", "tax", "rule",
+        "liability", "statute", "tax", "rule", "rules",
         "privacy", "breach", "contract", "penalty",
         "violation", "employment", "discrimination",
-        "consumer", "california", "federal", "state"
+        "consumer", "california", "federal", "state",
+        "gdpr", "hipaa", "eeoc", "usc", "cfr"
     ]
 
     strong_hit = any(k in query_lower for k in strong_keywords)
@@ -234,7 +287,10 @@ def should_use_llm_validation_fallback(query: str, confidence: float) -> bool:
         if not q:
             return False
 
-        if confidence >= 0.45:
+        if looks_like_system_query(q):
+            return False
+
+        if confidence >= 0.55:
             return False
 
         if confidence < 0.18:
@@ -242,10 +298,10 @@ def should_use_llm_validation_fallback(query: str, confidence: float) -> bool:
 
         legal_indicators = [
             "penalty", "penalties", "violation", "violations", "illegal",
-            "compliance", "law", "legal", "rule", "rights", "breach",
+            "compliance", "law", "legal", "rule", "rules", "rights", "breach",
             "contract", "employment", "privacy", "california", "state",
             "federal", "ssn", "discrimination", "retaliation", "wage",
-            "termination", "court", "case"
+            "termination", "court", "case", "gdpr", "hipaa", "eeoc", "usc", "cfr"
         ]
 
         if any(term in q for term in legal_indicators):
@@ -259,6 +315,57 @@ def should_use_llm_validation_fallback(query: str, confidence: float) -> bool:
     except Exception:
         return False
 
+def should_use_early_llm_legal_check(query: str) -> bool:
+    """
+    Use LLM earlier for short typo-heavy or abbreviation-heavy legal-looking queries.
+    This is stronger than plain keyword rules, but still keeps the flow stable.
+    """
+    try:
+        q = (query or "").lower().strip()
+        if not q:
+            return False
+
+        # system/meta queries should not enter here
+        if looks_like_system_query(q):
+            return False
+
+        # clearly unrelated general queries should not enter here
+        if looks_clearly_non_legal(q):
+            return False
+
+        token_count = len(q.split())
+
+        # only for short or medium legal-looking fragments
+        if token_count > 8:
+            return False
+
+        abbreviation_like = has_known_legal_abbreviation(query) or has_legal_citation(query)
+
+        typo_like_patterns = [
+            r"\bbrech\b",
+            r"\bcontrct\b",
+            r"\bcontrat\b",
+            r"\bprvacy\b",
+            r"\bcmpliance\b",
+            r"\bhipa\b",
+            r"\buscc\b",
+            r"\bcfrr\b",
+        ]
+
+        legal_like_terms = [
+            "law", "legal", "contract", "privacy", "tax", "rule", "rules",
+            "gdpr", "hipaa", "eeoc", "usc", "cfr", "violation", "penalty",
+            "employment", "rights", "duties", "compliance"
+        ]
+
+        typo_like = any(re.search(p, q, flags=re.IGNORECASE) for p in typo_like_patterns)
+        legal_like = any(term in q for term in legal_like_terms)
+
+        return abbreviation_like or typo_like or legal_like
+
+    except Exception:
+        return False 
+    
 
 def llm_validate_and_rewrite(query: str) -> tuple[bool, float, str]:
     """
@@ -274,6 +381,7 @@ def llm_validate_and_rewrite(query: str) -> tuple[bool, float, str]:
             "You are validating a user query for a legal search system.\n"
             "Decide whether the query is about law, regulation, compliance, court matters, legal rights, penalties, violations, contracts, employment law, privacy law, or similar legal topics.\n"
             "If it is legal, rewrite it into a short natural legal search query.\n"
+            "If it is clearly non-legal, mark it as not legal.\n"
             "Return ONLY this exact format:\n"
             "LEGAL: yes/no\n"
             "CONFIDENCE: 0.0 to 1.0\n"
@@ -323,6 +431,14 @@ def is_legal_query(query: str):
     try:
         raw_query = query or ""
 
+        # system/meta queries are not legal queries
+        if looks_like_system_query(raw_query):
+            return False, 0.0
+
+        # clearly non-legal consumer/general queries
+        if looks_clearly_non_legal(raw_query):
+            return False, 0.0
+
         corrected_query, abbr_typos = correct_legal_abbreviation_typos(raw_query)
         normalized_query = normalize_query_for_domain_check(corrected_query)
 
@@ -333,15 +449,42 @@ def is_legal_query(query: str):
             smart_abbr.update(abbr_typos)
 
         # -------------------------------
+        # 🔹 Early LLM check for short typo-heavy legal fragments
+        # Example:
+        # - brech of contrct
+        # - gdpr rules
+        # - eeoc complaint
+        # -------------------------------
+        if should_use_early_llm_legal_check(raw_query):
+            llm_is_legal, llm_confidence, llm_query = llm_validate_and_rewrite(raw_query)
+
+            if llm_is_legal:
+                # if LLM thinks it is legal, keep it in legal flow early
+                corrected_query = llm_query or corrected_query
+                normalized_query = normalize_query_for_domain_check(corrected_query)
+                expanded_query, smart_abbr = smart_expand_abbreviations(normalized_query)
+                query_lower = expanded_query.lower()
+
+                if abbr_typos:
+                    smart_abbr.update(abbr_typos)
+
+                early_llm_score = max(llm_confidence, 0.68)
+            else:
+                early_llm_score = 0.0
+        else:
+            early_llm_score = 0.0
+
+        # -------------------------------
         # 🔹 Strong keywords
         # -------------------------------
         strong_keywords = [
             "law", "act", "section", "court", "legal",
             "regulation", "compliance", "rights",
-            "liability", "statute", "tax", "rule",
+            "liability", "statute", "tax", "rule", "rules",
             "privacy", "breach", "contract", "penalty",
             "violation", "employment", "discrimination",
-            "consumer", "california", "federal", "state"
+            "consumer", "california", "federal", "state",
+            "gdpr", "hipaa", "eeoc", "usc", "cfr"
         ]
 
         strong_hit = any(k in query_lower for k in strong_keywords)
@@ -365,13 +508,13 @@ def is_legal_query(query: str):
             keyword_score = max(keyword_score, 0.90)
 
         if has_abbreviation:
-            keyword_score = max(keyword_score, 0.80)
+            keyword_score = max(keyword_score, 0.85)
 
         # -------------------------------
         # 🔹 Fast-path for obvious legal queries
         # -------------------------------
         if has_strong_legal_signal(corrected_query, expanded_query, smart_abbr):
-            fast_path_score = max(keyword_score, 0.72)
+            fast_path_score = max(keyword_score, 0.76)
         else:
             fast_path_score = keyword_score
 
@@ -394,16 +537,17 @@ def is_legal_query(query: str):
         # 🔹 Final score
         # -------------------------------
         final_score = (
-            0.34 * fast_path_score +
-            0.33 * ml_score +
-            0.33 * bert_score
+            0.28 * fast_path_score +
+            0.27 * ml_score +
+            0.25 * bert_score +
+            0.20 * early_llm_score
         )
 
         if keyword_score >= 0.45:
             final_score += 0.12
 
         if len(smart_abbr) > 0:
-            final_score += 0.18
+            final_score += 0.20
 
         if has_abbreviation:
             final_score += 0.18
@@ -417,13 +561,14 @@ def is_legal_query(query: str):
         if any(term in query_lower for term in [
             "penalties", "violation", "violations", "illegal",
             "employment", "discrimination", "retaliation",
-            "privacy", "breach", "consumer", "california"
+            "privacy", "breach", "consumer", "california",
+            "gdpr", "hipaa", "eeoc"
         ]):
             final_score += 0.10
 
         # boost when abbreviation typo correction succeeded
         if abbr_typos:
-            final_score = max(final_score, 0.68)
+            final_score = max(final_score, 0.72)
 
         final_score = min(final_score, 1.0)
 
@@ -432,7 +577,15 @@ def is_legal_query(query: str):
         # -------------------------------
         short_query = len(raw_query.split()) <= 6
         if short_query and (has_abbreviation or has_citation or len(smart_abbr) > 0 or abbr_typos):
-            final_score = max(final_score, 0.65)
+            final_score = max(final_score, 0.70)
+
+        # if early LLM recognized a short fragment as legal, do not reject it
+        if short_query and early_llm_score >= 0.68:
+            final_score = max(final_score, 0.68)
+
+        # protect obvious typo-heavy but legal queries like "brech of contrct law"
+        if short_query and any(x in raw_query.lower() for x in ["law", "contract", "privacy", "tax", "rule", "gdpr", "hipaa", "eeoc"]):
+            final_score = max(final_score, 0.55)
 
         return True, round(final_score, 3)
 
@@ -489,20 +642,23 @@ def validate_query(query: str):
         validated_query = raw_query
 
         # LLM fallback only for borderline cases
-        if confidence < 0.4 and should_use_llm_validation_fallback(raw_query, confidence):
+        if confidence < 0.55 and should_use_llm_validation_fallback(raw_query, confidence):
             llm_is_legal, llm_confidence, llm_query = llm_validate_and_rewrite(raw_query)
 
             if llm_is_legal:
                 validated_query = llm_query
-                confidence = max(confidence, llm_confidence, 0.62)
+                confidence = max(confidence, llm_confidence, 0.65)
 
         if confidence < 0.4:
             return {"error": "out_of_domain"}
 
         # -------------------------------
         # 🔹 PII masking
+        # IMPORTANT:
+        # do NOT lowercase before masking, otherwise lowercase names are distorted
+        # pii.py now handles lowercase-name detection safely
         # -------------------------------
-        masked_query, pii_flag = mask_pii(validated_query.lower())
+        masked_query, pii_flag = mask_pii(validated_query)
 
         # -------------------------------
         # 🔹 Final response (UNCHANGED SHAPE)

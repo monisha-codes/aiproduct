@@ -5,3 +5,6 @@ langdetect
 spacy
 transformers
 torch
+sentence-transformers
+pyspellchecker
+rapidfuzz

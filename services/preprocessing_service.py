@@ -4,6 +4,8 @@ from typing import Dict, List, Tuple, Any
 from spellchecker import SpellChecker
 from rapidfuzz import process, fuzz
 
+
+
 ABBREVIATIONS = {
     "ADA": "Americans with Disabilities Act",
     "USC": "United States Code",
@@ -142,7 +144,7 @@ def correct_abbreviation_typos_in_preprocessing(query: str):
             match = process.extractOne(clean, known_abbr_keys, scorer=fuzz.ratio)
             if match:
                 candidate, score, _ = match
-                if score >= 84:
+                if score >= 70:
                     fixed = known_abbr_map[candidate]
                     corrected_tokens.append(fixed)
                     corrections[raw] = fixed
@@ -295,8 +297,8 @@ def correct_spelling(query: str):
         # Step 1: protect placeholders like [SSN]
         protected_query, protected_map = protect_placeholders(query)
 
-        # Step 2: correct legal abbreviation typos first
-        protected_query, abbr_corrections = correct_abbreviation_typos_in_preprocessing(protected_query)
+        # Step 2: STRONG abbreviation correction FIRST (CRITICAL FIX)
+        protected_query, abbr_corrections = correct_abbreviation_typos_in_preprocessing(protected_query.upper())
 
         # Step 3: protect legal tokens like ssn, usc, gdpr, hipaa before spell correction
         protected_query, legal_token_map = protect_legal_tokens(protected_query)
@@ -341,6 +343,11 @@ def correct_spelling(query: str):
                 if match and match[1] >= 78:
                     corrected_words.append(word)
                     continue
+
+            # 🚨 DO NOT spell-correct short uppercase-like tokens (likely abbreviations)
+            if clean.isalpha() and len(clean) <= 5:
+                corrected_words.append(word)
+                continue
 
             correction = spell.correction(clean)
 
@@ -409,24 +416,33 @@ def clean_text(text: str) -> str:
 
 
 def extract_unknown_abbreviations(text: str) -> List[str]:
-    """
-    Detect likely abbreviations even if not present in ABBREVIATIONS.
-    Keeps them for downstream logic instead of ignoring them.
-    Ignores protected PII placeholders.
-    """
     if not text:
         return []
 
     matches = re.findall(r"\b[A-Z][A-Z\.\-&]{1,10}\b", text)
+
     candidates = []
-    ignored = {"NAME", "PHONE", "EMAIL", "SSN", "ZIP"}
+    ignored = {
+        "NAME", "PHONE", "EMAIL", "SSN", "ZIP",
+        "SECTION", "RULE", "RULES", "TITLE", "CHAPTER"   # ✅ FIX
+    }
 
     normalized_known = {k.replace(".", "").upper() for k in ABBREVIATIONS.keys()}
 
     for m in matches:
         normalized = m.strip(".").upper()
+
         if normalized in ignored:
             continue
+
+        # ❗ Ignore normal English uppercase words
+        if normalized.lower() in LEGAL_WHITELIST:
+            continue
+
+        # ❗ Ignore long words (real abbreviations are short)
+        if len(normalized) > 6:
+            continue
+
         if normalized not in normalized_known and len(normalized) >= 2:
             candidates.append(normalized)
 
@@ -453,12 +469,19 @@ def expand_abbreviations(text: str) -> Tuple[str, Dict[str, str], List[str]]:
     """
     Expand known abbreviations.
     Preserve unknown abbreviations separately instead of dropping them.
+    Avoid wrong SEC expansion in citation-style queries.
     """
     mapping: Dict[str, str] = {}
     expanded = text
 
-    # prefer longer keys first (e.g. U.S.C. before USC)
     for short, full in sorted(ABBREVIATIONS.items(), key=lambda x: len(x[0]), reverse=True):
+        # special handling for SEC to avoid:
+        # sec 1983 usc -> Securities and Exchange Commission
+        if short.upper() == "SEC":
+            sec_citation_pattern = re.compile(r"\bsec\.?\s+\d+", re.IGNORECASE)
+            if re.search(sec_citation_pattern, expanded):
+                continue
+
         pattern = re.compile(rf"\b{re.escape(short)}\b", re.IGNORECASE)
         if re.search(pattern, expanded):
             expanded = re.sub(pattern, f"{full} ({short})", expanded)
@@ -466,7 +489,6 @@ def expand_abbreviations(text: str) -> Tuple[str, Dict[str, str], List[str]]:
 
     unknown = extract_unknown_abbreviations(expanded)
     return expanded, mapping, unknown
-
 
 def extract_entities(text: str) -> Dict[str, List[str]]:
     """
@@ -636,7 +658,27 @@ def llm_rewrite_query(query: str) -> str:
     except Exception:
         return query
 
+def final_llm_fallback_rewrite(query: str) -> str:
+    """
+    Final safety net:
+    if restructuring is still weak, use LLM on the raw user query.
+    """
+    try:
+        if not query:
+            return query
 
+        rewritten = llm_rewrite_query(query)
+
+        if rewritten and len(rewritten.split()) >= 3:
+            rewritten = repair_common_legal_phrases(rewritten)
+            rewritten = strip_trailing_instruction_words(rewritten)
+            return rewritten.strip()
+
+        return query
+
+    except Exception:
+        return query
+    
 def filter_irrelevant_placeholders(text: str) -> str:
     """
     Keep only legally meaningful placeholders.
@@ -673,11 +715,11 @@ def normalize_rewrite_subject(text: str) -> str:
 
 def strip_trailing_instruction_words(text: str) -> str:
     """
-    Remove trailing instruction words that users append at the end,
-    like:
-    - sec 1983 usc explain
-    - hipaa define
-    - gdpr meaning
+    Remove trailing instruction words like:
+    - explain
+    - define
+    - describe
+    - meaning
     """
     if not text:
         return text
@@ -685,7 +727,7 @@ def strip_trailing_instruction_words(text: str) -> str:
     q = text.strip()
 
     q = re.sub(
-        r'\b(explain|define|description|describe|meaning|summarize|summary)\b\s*$',
+        r'\b(explain|define|describe|description|meaning|summarize|summary)\b\s*$',
         '',
         q,
         flags=re.IGNORECASE
@@ -693,6 +735,7 @@ def strip_trailing_instruction_words(text: str) -> str:
 
     q = re.sub(r'\s+', ' ', q).strip(" ,.-")
     return q
+
 
 def needs_legal_prefix(query: str) -> bool:
     """
@@ -831,24 +874,26 @@ def restructure_query(text: str, entities: dict, unknown_abbr: list):
             return len(re.findall(r"\[(?:NAME|EMAIL|PHONE|SSN|ZIP)\]", value, flags=re.IGNORECASE))
 
         def get_intent_prefix(q_low: str) -> str:
-            if any(k in q_low for k in ["penalty", "penalties", "fine", "punishment", "violation", "violations"]):
-                return "Explain the legal consequences of"
+            if any(k in q_low for k in ["penalty", "penalties", "fine", "violation"]):
+                return "What are the legal consequences of"
 
-            if any(k in q_low for k in ["how to", "process", "steps", "procedure", "file", "filing"]):
-                return "Explain the legal procedure for"
+            if any(k in q_low for k in ["process", "steps", "procedure", "filing"]):
+                return "What is the legal process for"
 
-            if any(k in q_low for k in ["rights", "duties", "obligations", "responsibilities"]):
-                return "Explain the legal rights and obligations in"
+            if any(k in q_low for k in ["rights", "duties", "obligations"]):
+                return "What are the legal rights related to"
 
-            if any(k in q_low for k in ["rule", "rules", "compliance", "regulation", "policy", "tax"]):
+            # IMPORTANT FIX
+            if any(k in q_low for k in ["rule", "rules", "regulation", "compliance", "policy"]):
                 return "Explain"
 
-            if any(k in q_low for k in ["contract", "agreement", "breach", "damages", "liability", "privacy"]):
-                return "Explain the legal aspects of"
+            if any(k in q_low for k in ["section", "usc", "cfr", "title"]):
+                return "Explain"
 
-            if any(k in q_low for k in ["meaning", "define"]):
-                return "Explain the legal meaning of"
+            if any(k in q_low for k in ["law", "act"]):
+                return "Explain"
 
+            # ❌ REMOVE legal meaning default
             return "Explain"
 
         def looks_bad_candidate(candidate_q: str) -> bool:
@@ -912,7 +957,7 @@ def restructure_query(text: str, entities: dict, unknown_abbr: list):
                         prefix = get_intent_prefix(llm_candidate_lower)
 
                         if prefix.lower() == "explain":
-                            prefix = "Explain the legal aspects of"
+                            prefix = "Explain"
 
                         return f"{prefix} {llm_subject}"
 
@@ -923,16 +968,16 @@ def restructure_query(text: str, entities: dict, unknown_abbr: list):
         # -------------------------------
         if len(cleaned_q.split()) <= 6:
             if unknown_abbr:
-                candidate = f"Explain the legal meaning of {subject}"
+                candidate = f"Explain {subject}"
 
             elif "section" in cleaned_q_lower or "usc" in cleaned_q_lower or "cfr" in cleaned_q_lower:
-                candidate = f"Explain the legal meaning of {subject}"
+                candidate = f"What does {subject} refer to in law"
 
             elif needs_legal_prefix(subject):
                 prefix = get_intent_prefix(cleaned_q_lower)
 
                 if prefix.lower() == "explain":
-                    prefix = "Explain the legal aspects of"
+                    prefix = "Explain"
 
                 candidate = f"{prefix} {subject}"
 
@@ -955,7 +1000,7 @@ def restructure_query(text: str, entities: dict, unknown_abbr: list):
                 prefix = get_intent_prefix(cleaned_q_lower)
 
                 if prefix.lower() == "explain":
-                    prefix = "Explain the legal aspects of"
+                    prefix = "Explain"
 
                 candidate = f"{prefix} {subject}"
                 candidate = repair_common_legal_phrases(candidate)
@@ -982,8 +1027,8 @@ def restructure_query(text: str, entities: dict, unknown_abbr: list):
 def force_meaningful_legal_prefix(query: str) -> str:
     """
     Final safety layer:
-    If restructure_query still returns only a legal noun phrase,
-    add a meaningful legal prefix.
+    If restructure_query still returns only a legal fragment,
+    add a natural legal prefix without sounding robotic.
     """
     try:
         if not query:
@@ -1006,28 +1051,34 @@ def force_meaningful_legal_prefix(query: str) -> str:
             "damages", "violation", "penalty", "penalties", "rights",
             "duties", "employment", "tax", "compliance", "regulation",
             "gdpr", "hipaa", "eeoc", "usc", "cfr", "section", "title",
-            "agreement", "consumer", "discrimination", "retaliation"
+            "agreement", "consumer", "discrimination", "retaliation", "act"
         ]
 
         if not any(term in q_lower for term in legal_terms):
             return q
 
+        # citation / section / code queries
         if any(k in q_lower for k in ["section", "usc", "cfr", "title"]):
-            return f"Explain the legal meaning of {q}"
-
-        if any(k in q_lower for k in ["penalty", "penalties", "fine", "punishment", "violation", "violations"]):
-            return f"Explain the legal consequences of {q}"
-
-        if any(k in q_lower for k in ["rights", "duties", "obligations", "responsibilities"]):
-            return f"Explain the legal rights and obligations in {q}"
-
-        if any(k in q_lower for k in ["how to", "process", "steps", "procedure", "file", "filing"]):
-            return f"Explain the legal procedure for {q}"
-
-        if any(k in q_lower for k in ["rule", "rules", "compliance", "regulation", "policy", "tax"]):
             return f"Explain {q}"
 
-        return f"Explain the legal aspects of {q}"
+        # law / act / regulation / rule queries
+        if any(k in q_lower for k in ["law", "act", "regulation", "rule", "rules", "compliance", "policy"]):
+            return f"Explain {q}"
+
+        # rights / duties
+        if any(k in q_lower for k in ["rights", "duties", "obligations", "responsibilities"]):
+            return f"What are the legal rights and obligations related to {q}"
+
+        # penalties / violations
+        if any(k in q_lower for k in ["penalty", "penalties", "fine", "punishment", "violation", "violations"]):
+            return f"What are the legal consequences of {q}"
+
+        # procedure-like
+        if any(k in q_lower for k in ["how to", "process", "steps", "procedure", "file", "filing"]):
+            return f"What is the legal process for {q}"
+
+        # default
+        return f"Explain {q}"
 
     except Exception:
         return query
@@ -1039,19 +1090,60 @@ def format_restructured_query(query: str):
 
         q = repair_common_legal_phrases(query.strip())
         q = re.sub(r'[?.!]+$', '', q)
-        q = re.sub(r'\s+', ' ', q).strip()
+        q = re.sub(r"\s+", " ", q).strip()
 
         if not q:
             return query
 
-        q = q[0].upper() + q[1:] if len(q) > 1 else q.upper()
+        # ✅ DO NOT force lowercase globally
+
+        abbreviation_map = {
+            "gdpr": "GDPR",
+            "hipaa": "HIPAA",
+            "eeoc": "EEOC",
+            "usc": "U.S.C.",
+            "cfr": "C.F.R.",
+            "ada": "ADA",
+            "ccpa": "CCPA",
+            "fdcpa": "FDCPA",
+            "ferpa": "FERPA",
+            "fmla": "FMLA",
+            "flsa": "FLSA",
+            "osha": "OSHA",
+            "erisa": "ERISA",
+            "rico": "RICO",
+            "dmca": "DMCA",
+            "coppa": "COPPA",
+            "sox": "SOX",
+            "scotus": "SCOTUS",
+            "doj": "DOJ",
+            "ftc": "FTC",
+            "irs": "IRS",
+            "sec": "SEC",
+            "epa": "EPA",
+        }
+
+        words = []
+        for w in q.split():
+            clean = re.sub(r'[^a-zA-Z\.]', '', w).lower()
+
+            if clean in abbreviation_map:
+                words.append(abbreviation_map[clean])
+            else:
+                # ✅ Title case normal words
+                words.append(w.capitalize())
+
+        q = " ".join(words)
+
+        # ensure first letter uppercase
+        q = q[0].upper() + q[1:]
 
         question_words = (
-            "what", "why", "how", "when", "where", "who",
-            "can", "is", "are", "do", "does", "should"
+            "What", "Why", "How", "When", "Where", "Who",
+            "Can", "Is", "Are", "Do", "Does", "Should"
         )
 
-        if any(q.lower().startswith(w) for w in question_words):
+        if any(q.startswith(w) for w in question_words):
             q += "?"
         else:
             q += "."
@@ -1060,31 +1152,128 @@ def format_restructured_query(query: str):
 
     except Exception:
         return query
-
-
-def strip_trailing_instruction_words(text: str) -> str:
+    
+def normalize_expanded_query_case(text: str) -> str:
     """
-    Remove trailing instruction words like:
-    - explain
-    - define
-    - describe
-    - meaning
+    Make expanded query human-readable:
+    - full form in Title Case
+    - abbreviation in uppercase inside brackets
+    - remaining words in lowercase
+    Example:
+      General Data Protection Regulation (GDPR) rules
     """
-    if not text:
+    try:
+        if not text:
+            return text
+
+        q = text.strip()
+        q = re.sub(r"\s+", " ", q).strip()
+
+        replacements = {
+            r"general data protection regulation\s*\(gdpr\)": "General Data Protection Regulation (GDPR)",
+            r"health insurance portability and accountability act\s*\(hipaa\)": "Health Insurance Portability and Accountability Act (HIPAA)",
+            r"equal employment opportunity commission\s*\(eeoc\)": "Equal Employment Opportunity Commission (EEOC)",
+            r"united states code\s*\(usc\)": "United States Code (USC)",
+            r"code of federal regulations\s*\(cfr\)": "Code of Federal Regulations (CFR)",
+            r"california consumer privacy act\s*\(ccpa\)": "California Consumer Privacy Act (CCPA)",
+            r"family and medical leave act\s*\(fmla\)": "Family and Medical Leave Act (FMLA)",
+            r"fair labor standards act\s*\(flsa\)": "Fair Labor Standards Act (FLSA)",
+            r"occupational safety and health administration\s*\(osha\)": "Occupational Safety and Health Administration (OSHA)",
+            r"americans with disabilities act\s*\(ada\)": "Americans with Disabilities Act (ADA)",
+        }
+
+        q = q.lower()
+        for pattern, replacement in replacements.items():
+            q = re.sub(pattern, replacement, q, flags=re.IGNORECASE)
+
+        # lowercase normal leftover words, but keep the already-restored title-case phrases
+        q = re.sub(r"\s+", " ", q).strip()
+        return q
+
+    except Exception:
         return text
 
-    q = text.strip()
 
-    q = re.sub(
-        r'\b(explain|define|describe|description|meaning|summarize|summary)\b\s*$',
-        '',
-        q,
-        flags=re.IGNORECASE
-    )
+def restore_expanded_terms_in_restructured(restructured: str, expanded_text: str, abbr_map: dict) -> str:
+    """
+    Restore correct casing of expanded legal phrases inside restructured query.
+    Example:
+      '... general data protection regulation gdpr rules'
+      -> '... General Data Protection Regulation (GDPR) rules'
+    """
+    try:
+        if not restructured:
+            return restructured
 
-    q = re.sub(r'\s+', ' ', q).strip(" ,.-")
-    return q
+        result = restructured
 
+        # restore exact expanded phrase if present in expanded_text
+        expanded_patterns = re.findall(r'([A-Z][A-Za-z&,\-/ ]+\([A-Z0-9\.]+\))', expanded_text)
+        for phrase in expanded_patterns:
+            plain = re.sub(r"\s*\(([A-Z0-9\.]+)\)", r" \1", phrase).strip()
+            result = re.sub(re.escape(plain), phrase, result, flags=re.IGNORECASE)
+            result = re.sub(re.escape(phrase.lower()), phrase, result, flags=re.IGNORECASE)
+
+        # also restore from abbreviation map when possible
+        for short, full in (abbr_map or {}).items():
+            phrase = f"{full} ({short})"
+            plain = f"{full} {short}"
+
+            result = re.sub(re.escape(plain), phrase, result, flags=re.IGNORECASE)
+            result = re.sub(re.escape(full.lower()), full, result, flags=re.IGNORECASE)
+            result = re.sub(rf"\b{re.escape(short.lower())}\b", short, result, flags=re.IGNORECASE)
+
+        result = re.sub(r"\s+", " ", result).strip()
+        return result
+
+    except Exception:
+        return restructured
+    
+
+def restore_expanded_phrase_in_restructured(restructured: str, expanded_text: str, abbr_map: dict) -> str:
+    """
+    Restore proper casing and bracketed abbreviation form inside restructured query.
+    Example:
+      general data protection regulation gdpr rules
+      -> General Data Protection Regulation (GDPR) rules
+    """
+    try:
+        if not restructured:
+            return restructured
+
+        result = restructured
+
+        for short, full in (abbr_map or {}).items():
+            phrase_with_brackets = f"{full} ({short})"
+            phrase_without_brackets = f"{full} {short}"
+
+            result = re.sub(
+                re.escape(phrase_without_brackets),
+                phrase_with_brackets,
+                result,
+                flags=re.IGNORECASE
+            )
+
+            result = re.sub(
+                re.escape(full.lower()),
+                full,
+                result,
+                flags=re.IGNORECASE
+            )
+
+            result = re.sub(
+                rf"\b{re.escape(short.lower())}\b",
+                short,
+                result,
+                flags=re.IGNORECASE
+            )
+
+        result = re.sub(r"\s+", " ", result).strip()
+        return result
+
+    except Exception:
+        return restructured
+    
 
 def preprocess_query(data: dict) -> dict:
     """
@@ -1093,6 +1282,18 @@ def preprocess_query(data: dict) -> dict:
     """
     try:
         raw_query = data.get("query", "")
+
+        # 🚨 HARD STOP for meaningless placeholder-only queries
+        if re.fullmatch(r"\[(NAME|EMAIL|PHONE|SSN|ZIP)\]", raw_query.strip(), flags=re.IGNORECASE):
+            return {
+                "original_query": raw_query,
+                "cleaned_query": raw_query,
+                "expanded_query": raw_query,
+                "restructured_query": "",
+                "abbreviations": {},
+                "unknown_abbreviations": [],
+                "entities": {},
+            }
 
         cleaned = clean_text(raw_query)
 
@@ -1107,6 +1308,9 @@ def preprocess_query(data: dict) -> dict:
 
         expanded_text, abbr_map, unknown_abbr = expand_abbreviations(cleaned)
 
+        # ✅ normalize expanded query style for display
+        expanded_text = normalize_expanded_query_case(expanded_text)
+
         # remove trailing command words before entity extraction / restructuring
         expanded_text = strip_trailing_instruction_words(expanded_text)
 
@@ -1118,7 +1322,25 @@ def preprocess_query(data: dict) -> dict:
         restructured = strip_trailing_instruction_words(restructured)
 
         restructured = force_meaningful_legal_prefix(restructured)
+
+        # FINAL SAFETY NET:
+        
+        if (
+            not restructured
+            or len(restructured.split()) <= 3
+            or restructured.lower().strip() in {"explain", "define", "law"}
+            or restructured.lower().endswith(" explain")
+            or "explain explain" in restructured.lower()
+        ):
+            restructured = final_llm_fallback_rewrite(raw_query)
+            restructured = strip_trailing_instruction_words(restructured)
+            restructured = force_meaningful_legal_prefix(restructured)
+
+        # ✅ restore proper expanded abbreviation casing in final restructured query
+        
         restructured = format_restructured_query(restructured)
+        restructured = restore_expanded_phrase_in_restructured(restructured, expanded_text, abbr_map)
+
         return {
             "original_query": raw_query,
             "cleaned_query": cleaned,
@@ -1134,3 +1356,5 @@ def preprocess_query(data: dict) -> dict:
             "error": "preprocessing_failed",
             "details": str(e),
         }
+
+

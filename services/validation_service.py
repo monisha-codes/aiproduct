@@ -62,7 +62,10 @@ NON_LEGAL_SYSTEM_HINTS = {
 CLEAR_NON_LEGAL_HINTS = {
     "movie", "movies", "recipe", "cook", "cooking", "biryani",
     "laptop", "mobile", "phone price", "weather", "temperature",
-    "cricket", "football", "music", "song", "restaurant", "shopping"
+    "cricket", "football", "music", "song", "restaurant", "shopping",
+    "runs", "score", "scored", "match", "matches", "wicket", "wickets",
+    "ipl", "odi", "t20", "batting", "bowling", "goal", "goals",
+    "yesterday match", "today match", "live score", "points table"
 }
 
 classifier = None
@@ -162,11 +165,11 @@ def has_known_legal_abbreviation(query: str) -> bool:
 
 def correct_legal_abbreviation_typos(query: str):
     """
-    Fix likely legal abbreviation spelling mistakes before domain validation.
-    Examples:
+    Strong abbreviation typo correction (critical fix)
+    Example:
+    gspr -> GDPR
     hipa -> HIPAA
     uscc -> USC
-    gdpr -> GDPR
     """
     try:
         if not query:
@@ -180,25 +183,30 @@ def correct_legal_abbreviation_typos(query: str):
             abbr.lower().replace(".", ""): abbr
             for abbr in KNOWN_LEGAL_ABBREVIATIONS
         }
-        known_abbr_keys = list(known_abbr_map.keys())
+
+        known_keys = list(known_abbr_map.keys())
 
         for token in tokens:
             raw = token
-            clean = re.sub(r"[^a-zA-Z\.]", "", token).lower().replace(".", "")
+            clean = re.sub(r"[^a-zA-Z]", "", token).lower()
 
-            if not clean or len(clean) < 3:
+            if len(clean) < 3:
                 corrected_tokens.append(raw)
                 continue
 
+            # ✅ Direct match
             if clean in known_abbr_map:
                 corrected_tokens.append(known_abbr_map[clean])
                 continue
 
-            match = process.extractOne(clean, known_abbr_keys, scorer=fuzz.ratio)
+            # ✅ Strong fuzzy match (FIXED)
+            match = process.extractOne(clean, known_keys, scorer=fuzz.WRatio)
 
             if match:
                 candidate, score, _ = match
-                if score >= 80:
+
+                # 🔥 KEY CHANGE: lowered threshold (IMPORTANT)
+                if score >= 72:
                     fixed = known_abbr_map[candidate]
                     corrections[raw] = fixed
                     corrected_tokens.append(fixed)
@@ -252,7 +260,23 @@ def looks_clearly_non_legal(query: str) -> bool:
     if any(term in q for term in CLEAR_NON_LEGAL_HINTS):
         return True
 
-    return False
+    sports_patterns = [
+        r"\bhow many runs\b",
+        r"\bwho won\b",
+        r"\blive score\b",
+        r"\bscore yesterday\b",
+        r"\bpoints table\b",
+        r"\bmatch\b.*\bscore\b",
+        r"\bcricket\b",
+        r"\bfootball\b",
+        r"\bipl\b",
+        r"\bodi\b",
+        r"\bt20\b",
+        r"\bwicket\b",
+        r"\bgoal\b",
+    ]
+
+    return any(re.search(p, q, flags=re.IGNORECASE) for p in sports_patterns)
 
 
 def has_strong_legal_signal(query: str, expanded_query: str, smart_abbr: dict) -> bool:
@@ -336,7 +360,7 @@ def should_use_early_llm_legal_check(query: str) -> bool:
         token_count = len(q.split())
 
         # only for short or medium legal-looking fragments
-        if token_count > 8:
+        if token_count > 10:
             return False
 
         abbreviation_like = has_known_legal_abbreviation(query) or has_legal_citation(query)
@@ -361,7 +385,10 @@ def should_use_early_llm_legal_check(query: str) -> bool:
         typo_like = any(re.search(p, q, flags=re.IGNORECASE) for p in typo_like_patterns)
         legal_like = any(term in q for term in legal_like_terms)
 
-        return abbreviation_like or typo_like or legal_like
+        # 🔥 FORCE LLM for unknown abbreviations (CRITICAL FIX)
+        unknown_abbr_like = bool(re.fullmatch(r"[a-z]{3,6}", q.strip()))
+
+        abbreviation_like or typo_like or legal_like or unknown_abbr_like
 
     except Exception:
         return False 
@@ -568,7 +595,7 @@ def is_legal_query(query: str):
 
         # boost when abbreviation typo correction succeeded
         if abbr_typos:
-            final_score = max(final_score, 0.72)
+            final_score = max(final_score, 0.78)
 
         final_score = min(final_score, 1.0)
 
@@ -586,7 +613,12 @@ def is_legal_query(query: str):
         # protect obvious typo-heavy but legal queries like "brech of contrct law"
         if short_query and any(x in raw_query.lower() for x in ["law", "contract", "privacy", "tax", "rule", "gdpr", "hipaa", "eeoc"]):
             final_score = max(final_score, 0.55)
-
+                
+                
+        # final override: obvious non-legal queries must not pass
+        if looks_clearly_non_legal(raw_query):
+            return False, 0.0
+        
         return True, round(final_score, 3)
 
     except Exception as e:
@@ -601,8 +633,11 @@ def validate_query(query: str):
     try:
         raw_query = query.strip()
         normalized_query = raw_query.lower()
-
         token_count = len(normalized_query.split())
+        
+        # hard reject for clearly non-legal general queries
+        if looks_clearly_non_legal(raw_query):
+            return {"error": "out_of_domain"}
 
         # -------------------------------
         # 🔹 Length check
@@ -649,7 +684,8 @@ def validate_query(query: str):
                 validated_query = llm_query
                 confidence = max(confidence, llm_confidence, 0.65)
 
-        if confidence < 0.4:
+        # 🔥 DO NOT reject if abbreviation typo was corrected
+        if confidence < 0.4 and not re.search(r"\b[A-Z]{3,6}\b", validated_query):
             return {"error": "out_of_domain"}
 
         # -------------------------------

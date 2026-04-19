@@ -298,7 +298,7 @@ def correct_spelling(query: str):
         protected_query, protected_map = protect_placeholders(query)
 
         # Step 2: STRONG abbreviation correction FIRST (CRITICAL FIX)
-        protected_query, abbr_corrections = correct_abbreviation_typos_in_preprocessing(protected_query.upper())
+        protected_query, abbr_corrections = correct_abbreviation_typos_in_preprocessing(protected_query)
 
         # Step 3: protect legal tokens like ssn, usc, gdpr, hipaa before spell correction
         protected_query, legal_token_map = protect_legal_tokens(protected_query)
@@ -416,37 +416,57 @@ def clean_text(text: str) -> str:
 
 
 def extract_unknown_abbreviations(text: str) -> List[str]:
+    """
+    Detect likely unknown abbreviations only.
+    Avoid normal English words like TAX, DEFINE, OF, SECTION, RULES, etc.
+    """
     if not text:
         return []
 
-    matches = re.findall(r"\b[A-Z][A-Z\.\-&]{1,10}\b", text)
+    candidates = set()
 
-    candidates = []
     ignored = {
         "NAME", "PHONE", "EMAIL", "SSN", "ZIP",
-        "SECTION", "RULE", "RULES", "TITLE", "CHAPTER"   # ✅ FIX
+        "SECTION", "SECTIONS", "RULE", "RULES", "TITLE", "CHAPTER",
+        "DEFINE", "EXPLAIN", "DESCRIBE", "SUMMARY", "SUMMARIZE",
+        "LAW", "LAWS", "TAX", "OF", "AND", "OR", "THE", "A", "AN",
+        "IN", "ON", "FOR", "TO", "WITH", "BY", "FROM", "AT"
     }
 
-    normalized_known = {k.replace(".", "").upper() for k in ABBREVIATIONS.keys()}
+    ignored.update({w.upper() for w in QUESTION_STARTERS})
+    ignored.update({w.upper() for w in LEGAL_HINT_TERMS})
 
-    for m in matches:
-        normalized = m.strip(".").upper()
+    normalized_known = {
+        re.sub(r"[^A-Z]", "", k.upper())
+        for k in ABBREVIATIONS.keys()
+    }
+
+    # Match:
+    # - plain uppercase abbreviations like GDPR, EEOC
+    # - dotted abbreviations like U.S.C.
+    matches = re.findall(r"\b(?:[A-Z]{2,6}|(?:[A-Z]\.){2,}[A-Z]?\.?)\b", text)
+
+    for token in matches:
+        normalized = re.sub(r"[^A-Z]", "", token.upper())
+
+        if not normalized:
+            continue
 
         if normalized in ignored:
             continue
 
-        # ❗ Ignore normal English uppercase words
+        if normalized in normalized_known:
+            continue
+
         if normalized.lower() in LEGAL_WHITELIST:
             continue
 
-        # ❗ Ignore long words (real abbreviations are short)
-        if len(normalized) > 6:
+        if len(normalized) < 2 or len(normalized) > 6:
             continue
 
-        if normalized not in normalized_known and len(normalized) >= 2:
-            candidates.append(normalized)
+        candidates.add(token)
 
-    return sorted(set(candidates))
+    return sorted(candidates)
 
 def normalize_legal_citation_shortcuts(text: str) -> str:
     """
@@ -1084,66 +1104,62 @@ def force_meaningful_legal_prefix(query: str) -> str:
         return query
 
 def format_restructured_query(query: str):
+    """
+    Final natural formatting:
+    - sentence case, not title case for every word
+    - preserve legal abbreviations like GDPR, HIPAA, EEOC, U.S.C., C.F.R.
+    - keep output natural
+    """
     try:
         if not query:
             return query
 
         q = repair_common_legal_phrases(query.strip())
         q = re.sub(r'[?.!]+$', '', q)
-        q = re.sub(r"\s+", " ", q).strip()
+        q = re.sub(r'\s+', ' ', q).strip()
 
         if not q:
             return query
 
-        # ✅ DO NOT force lowercase globally
+        # sentence-style lowercase first
+        q = q.lower()
 
-        abbreviation_map = {
-            "gdpr": "GDPR",
-            "hipaa": "HIPAA",
-            "eeoc": "EEOC",
-            "usc": "U.S.C.",
-            "cfr": "C.F.R.",
-            "ada": "ADA",
-            "ccpa": "CCPA",
-            "fdcpa": "FDCPA",
-            "ferpa": "FERPA",
-            "fmla": "FMLA",
-            "flsa": "FLSA",
-            "osha": "OSHA",
-            "erisa": "ERISA",
-            "rico": "RICO",
-            "dmca": "DMCA",
-            "coppa": "COPPA",
-            "sox": "SOX",
-            "scotus": "SCOTUS",
-            "doj": "DOJ",
-            "ftc": "FTC",
-            "irs": "IRS",
-            "sec": "SEC",
-            "epa": "EPA",
-        }
+        # restore common legal abbreviations
+        q = re.sub(r"\bgdpr\b", "GDPR", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bhipaa\b", "HIPAA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\beeoc\b", "EEOC", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bada\b", "ADA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bccpa\b", "CCPA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bfdcpa\b", "FDCPA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bferpa\b", "FERPA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bfmla\b", "FMLA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bflsa\b", "FLSA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bosha\b", "OSHA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\berisa\b", "ERISA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\brico\b", "RICO", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bdmca\b", "DMCA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bcoppa\b", "COPPA", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bsox\b", "SOX", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bscotus\b", "SCOTUS", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bdoj\b", "DOJ", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bftc\b", "FTC", q, flags=re.IGNORECASE)
+        q = re.sub(r"\birs\b", "IRS", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bsec\b", "SEC", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bepa\b", "EPA", q, flags=re.IGNORECASE)
 
-        words = []
-        for w in q.split():
-            clean = re.sub(r'[^a-zA-Z\.]', '', w).lower()
+        # restore dotted legal abbreviations
+        q = re.sub(r"\bu\.?s\.?c\.?\b", "U.S.C.", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bc\.?f\.?r\.?\b", "C.F.R.", q, flags=re.IGNORECASE)
 
-            if clean in abbreviation_map:
-                words.append(abbreviation_map[clean])
-            else:
-                # ✅ Title case normal words
-                words.append(w.capitalize())
-
-        q = " ".join(words)
-
-        # ensure first letter uppercase
+        # capitalize only the first character of the whole sentence
         q = q[0].upper() + q[1:]
 
         question_words = (
-            "What", "Why", "How", "When", "Where", "Who",
-            "Can", "Is", "Are", "Do", "Does", "Should"
+            "what", "why", "how", "when", "where", "who",
+            "can", "is", "are", "do", "does", "should"
         )
 
-        if any(q.startswith(w) for w in question_words):
+        if any(q.lower().startswith(w) for w in question_words):
             q += "?"
         else:
             q += "."
@@ -1193,42 +1209,6 @@ def normalize_expanded_query_case(text: str) -> str:
     except Exception:
         return text
 
-
-def restore_expanded_terms_in_restructured(restructured: str, expanded_text: str, abbr_map: dict) -> str:
-    """
-    Restore correct casing of expanded legal phrases inside restructured query.
-    Example:
-      '... general data protection regulation gdpr rules'
-      -> '... General Data Protection Regulation (GDPR) rules'
-    """
-    try:
-        if not restructured:
-            return restructured
-
-        result = restructured
-
-        # restore exact expanded phrase if present in expanded_text
-        expanded_patterns = re.findall(r'([A-Z][A-Za-z&,\-/ ]+\([A-Z0-9\.]+\))', expanded_text)
-        for phrase in expanded_patterns:
-            plain = re.sub(r"\s*\(([A-Z0-9\.]+)\)", r" \1", phrase).strip()
-            result = re.sub(re.escape(plain), phrase, result, flags=re.IGNORECASE)
-            result = re.sub(re.escape(phrase.lower()), phrase, result, flags=re.IGNORECASE)
-
-        # also restore from abbreviation map when possible
-        for short, full in (abbr_map or {}).items():
-            phrase = f"{full} ({short})"
-            plain = f"{full} {short}"
-
-            result = re.sub(re.escape(plain), phrase, result, flags=re.IGNORECASE)
-            result = re.sub(re.escape(full.lower()), full, result, flags=re.IGNORECASE)
-            result = re.sub(rf"\b{re.escape(short.lower())}\b", short, result, flags=re.IGNORECASE)
-
-        result = re.sub(r"\s+", " ", result).strip()
-        return result
-
-    except Exception:
-        return restructured
-    
 
 def restore_expanded_phrase_in_restructured(restructured: str, expanded_text: str, abbr_map: dict) -> str:
     """

@@ -180,7 +180,7 @@ def get_ollama_classifier():
         try:
             ollama_classifier = {
                 "base_url": "http://localhost:11434/api/generate",
-                "model": "qwen2.5:3b"
+                "model": "qwen2.5:7b"
             }
         except Exception:
             ollama_classifier = False
@@ -322,12 +322,13 @@ def llm_detect_temporal(query: str) -> bool:
     except Exception:
         return False
     
-def compute_complexity(intent: str, jurisdiction: list, temporal: bool, query: str) -> str:
+def compute_complexity(intent, jurisdiction, temporal, query):
     multi_jurisdiction = len(jurisdiction) >= 2
     multi_intent = isinstance(intent, str) and "," in intent
-    long_query = len((query or "").split()) > 15
+    long_query = len(query.split()) > 15
 
-    if multi_jurisdiction or multi_intent or temporal or long_query:
+    # FIX: temporal alone should NOT make it complex
+    if multi_jurisdiction or multi_intent or long_query:
         return "complex"
 
     return "simple"
